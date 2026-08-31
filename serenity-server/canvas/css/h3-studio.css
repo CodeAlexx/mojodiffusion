@@ -211,6 +211,21 @@
 .h3s-request summary { cursor: pointer; padding: 8px 10px; color: var(--h3-cyan); font-size: 10px; font-weight: 700; }
 .h3s-request pre { max-height: 230px; overflow: auto; padding: 10px; border-top: 1px solid var(--h3-line); color: #b8c4bd; font: 9.5px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
 
+.h3s-endless-card {
+    padding: 11px; border: 1px solid rgba(114,198,196,.3); border-radius: 5px;
+    background: linear-gradient(145deg, rgba(114,198,196,.045), rgba(232,168,76,.025));
+}
+.h3s-endless-progress { margin-top: 11px; color: var(--h3-muted); font: 650 10px/1.4 ui-monospace, monospace; }
+.h3s-endless-progress strong { color: var(--h3-ink); }
+.h3s-progress-track { height: 5px; margin-top: 6px; overflow: hidden; border-radius: 9px; background: #090c0d; }
+.h3s-progress-track span { display: block; height: 100%; background: linear-gradient(90deg, var(--h3-cyan), var(--h3-amber)); transition: width .2s ease; }
+.h3s-endless-outputs {
+    max-height: 150px; overflow: auto; margin: 10px 0 0; padding: 8px 8px 8px 28px;
+    border: 1px solid var(--h3-line); border-radius: 4px; color: var(--h3-muted);
+    background: #0b0f10; font: 600 9.5px/1.7 ui-monospace, monospace;
+}
+.h3s-endless-outputs a { color: var(--h3-cyan); }
+
 .h3s-inspector-tabs { margin: 10px 10px 0; }
 .h3s-inspector-body { padding: 12px; }
 .h3s-check { display: flex; align-items: flex-start; gap: 7px; color: var(--h3-muted); font-size: 10.5px; line-height: 1.35; }

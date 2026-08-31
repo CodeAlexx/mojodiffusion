@@ -24,6 +24,8 @@ var H3StudioTab = (function () {
         status: 'Ready · opening Studio never starts GPU work',
         statusTone: '',
         videoPollToken: 0,
+        endlessPollToken: 0,
+        endlessSubmitting: false,
         modal: ''
     };
 
@@ -220,6 +222,39 @@ var H3StudioTab = (function () {
             '<textarea class="h3s-textarea is-prompt" data-shot-field="prompt_override" placeholder="Canonical prompt…">' + escapeHtml(prompt) + '</textarea>';
     }
 
+    function endlessState() {
+        if (!state.project.endless) state.project.endless = C.createEmptyEndless(state.project.target_duration_seconds);
+        return state.project.endless;
+    }
+
+    function endlessStageHtml() {
+        var run = endlessState();
+        var active = ['submitting', 'running', 'stopping'].indexOf(run.status) >= 0;
+        var completed = run.completed_job_ids.length;
+        var planned = run.segment_durations.length || 0;
+        var renderedFrames = (run.segment_output_frames || []).slice(0, completed).reduce(function (sum, frames) { return sum + Number(frames || 0); }, 0);
+        var activeText = run.active_job ? (' · active ' + escapeHtml(run.active_job.video_id || 'job')) : '';
+        var outputs = run.completed_job_ids.map(function (jobId, index) {
+            var path = run.completed_output_paths[index] || '';
+            var playablePath = /^\/(?!\/)/.test(path) ? path : '';
+            return '<li><strong>' + escapeHtml(jobId) + '</strong> · segment ' + (index + 1) +
+                (playablePath ? ' · <a href="' + attr(playablePath) + '" target="_blank" rel="noopener">open MP4</a>' : '') + '</li>';
+        }).join('');
+        return '<div class="h3s-endless-card"><div class="h3s-panel-head"><div><div class="h3s-kicker">Endless story · inference only</div>' +
+            '<div class="h3s-stage-copy" style="margin:4px 0 0">Serial H3 renders reuse the prior job’s native 22-frame motion/audio context. The browser never rebuilds model state or starts training.</div></div>' +
+            '<span class="h3s-chip ' + (run.status === 'failed' ? 'is-blocked' : (run.status === 'completed' ? 'is-ready' : '')) + '">' + escapeHtml(String(run.status || 'idle').toUpperCase()) + '</span></div>' +
+            '<div class="h3s-grid-2"><label class="h3s-field"><span>Target runtime · 5–3600s</span><input class="h3s-input" type="number" min="5" max="3600" step="0.041666667" data-endless-field="target_seconds" value="' + attr(run.target_seconds) + '"' + disabled(active) + '></label>' +
+            '<label class="h3s-field"><span>Preferred segment · 5–15s</span><input class="h3s-input" type="number" min="5" max="15" step="0.041666667" data-endless-field="segment_seconds" value="' + attr(run.segment_seconds) + '"' + disabled(active) + '></label></div>' +
+            '<label class="h3s-field"><span>Direction repeated for every continuation</span><textarea class="h3s-textarea" data-endless-field="continuation_direction"' + disabled(active) + '>' + escapeHtml(run.continuation_direction) + '</textarea></label>' +
+            '<div class="h3s-button-row"><button class="h3s-btn is-primary" data-h3-action="start-endless"' + disabled(active) + '>Start endless story</button>' +
+            '<button class="h3s-btn" data-h3-action="stop-endless"' + disabled(!active || run.status === 'stopping') + '>Stop after current</button>' +
+            '<button class="h3s-btn is-quiet" data-h3-action="reset-endless"' + disabled(active) + '>Reset run</button></div>' +
+            '<div class="h3s-endless-progress"><div><strong>' + completed + (planned ? ' / ' + planned : '') + '</strong> segments · ' + renderedFrames + ' frames / ' + Number(run.target_frames || 0) + ' · ' + C.secondsText(renderedFrames / C.NATIVE_FPS) + 's rendered' + activeText + '</div>' +
+            '<div class="h3s-progress-track"><span style="width:' + (planned ? Math.min(100, completed * 100 / planned) : 0) + '%"></span></div></div>' +
+            (run.error ? '<div class="h3s-warning h3s-error">' + escapeHtml(run.error) + '</div>' : '') +
+            (outputs ? '<ol class="h3s-endless-outputs">' + outputs + '</ol>' : '') + '</div>';
+    }
+
     function directorStageHtml() {
         var action = C.actionById(state.directorAction);
         var minShots = C.directorMinimumShots(state.project);
@@ -233,15 +268,15 @@ var H3StudioTab = (function () {
                 '<label class="h3s-field"><span>Style</span><select id="h3s-character-style" class="h3s-select"><option value="standard_orbit"' + selected(state.characterStyle, 'standard_orbit') + '>Keep Picture 1 style</option><option value="anime_to_real"' + selected(state.characterStyle, 'anime_to_real') + '>Anime to photoreal</option></select></label></div>' +
                 (state.characterPanels === 4 ? '<div class="h3s-warning">Four-panel is metadata only: the upstream geometry conflicts and 73 frames is below Serenity’s five-second render minimum.</div>' : '') : '') +
             '<label class="h3s-field"><span>Director input</span><textarea class="h3s-textarea is-script" data-project-field="director_brief" placeholder="Story outline, script, edit request, shot diagnosis, or character extraction instructions…">' + escapeHtml(state.project.director_brief) + '</textarea></label>' +
-            '<div class="h3s-button-row"><button class="h3s-btn is-primary" data-h3-action="run-director"' + disabled(state.directorRunning) + '>' + (state.directorRunning ? 'Director pass running…' : 'Run Qwen Director pass') + '</button><button class="h3s-btn" data-h3-action="apply-director"' + disabled(!directorResultJson()) + '>Apply result to project</button><button class="h3s-btn" data-h3-action="prepare-director">Prepare request only</button><button class="h3s-btn" data-h3-action="copy-request"' + disabled(!state.requestJson) + '>Copy request</button><button class="h3s-btn" data-h3-action="download-request"' + disabled(!state.requestJson) + '>Download request</button></div>' +
+            '<div class="h3s-button-row"><button class="h3s-btn is-primary" data-h3-action="run-director"' + disabled(state.directorRunning) + '>' + (state.directorRunning ? 'Director pass running…' : 'Run Qwen Director pass') + '</button><button class="h3s-btn" data-h3-action="apply-director"' + disabled(!directorResultJson()) + '>Apply result to project</button><button class="h3s-btn" data-h3-action="prepare-director">Prepare Qwen Director pass</button><button class="h3s-btn" data-h3-action="copy-request"' + disabled(!state.requestJson) + '>Copy request</button><button class="h3s-btn" data-h3-action="download-request"' + disabled(!state.requestJson) + '>Download request</button></div>' +
             '<div class="h3s-help" style="margin-top:7px">Plan envelope: ' + minShots + '–' + maxShots + ' shots · ' + state.project.takes_per_shot + ' take(s) each. Run launches the pure-Mojo Qwen3-VL H3 captioner on the GPU (about 1–3 minutes, no H3 render). Prepare only is CPU-only.</div>' +
             directorResultHtml() +
             (state.requestJson ? '<details class="h3s-request"><summary>Prepared serenity.h3.caption.v2 request</summary><pre>' + escapeHtml(state.requestJson) + '</pre></details>' : '');
     }
 
     function stageHtml() {
-        var tabs = [['brief', 'Brief'], ['plan', 'Shot plan'], ['prompt', 'H3 prompt'], ['director', 'Director']];
-        var body = state.stageTab === 'brief' ? briefStageHtml() : state.stageTab === 'plan' ? planStageHtml() : state.stageTab === 'prompt' ? promptStageHtml() : directorStageHtml();
+        var tabs = [['brief', 'Brief'], ['plan', 'Shot plan'], ['prompt', 'H3 prompt'], ['director', 'Director'], ['endless', 'Endless']];
+        var body = state.stageTab === 'brief' ? briefStageHtml() : state.stageTab === 'plan' ? planStageHtml() : state.stageTab === 'prompt' ? promptStageHtml() : state.stageTab === 'endless' ? endlessStageHtml() : directorStageHtml();
         return '<div class="h3s-stage"><div class="h3s-stage-tabs">' + tabs.map(function (tab) {
             return '<button class="h3s-tab ' + (state.stageTab === tab[0] ? 'is-active' : '') + '" data-stage-tab="' + tab[0] + '">' + tab[1] + '</button>';
         }).join('') + '</div><div class="h3s-stage-body">' + body + '</div>' +
@@ -362,11 +397,18 @@ var H3StudioTab = (function () {
         var value = target.type === 'checkbox' ? target.checked : target.value;
         if (['project_kind', 'caption_tier', 'delivery_fps', 'target_duration_seconds', 'takes_per_shot'].indexOf(field) >= 0) value = Number(value);
         state.project[field] = value;
+        if (field === 'target_duration_seconds' && endlessState().status === 'idle') {
+            endlessState().target_seconds = value;
+            endlessState().target_frames = Math.round(value * C.NATIVE_FPS);
+        }
         saveProject();
     }
 
     function setShotField(field, target) {
         var shot = selectedShot();
+        if (baseShotMutationBlocked(shot)) {
+            showToast('The endless base shot is immutable until this run stops or completes.', 'error'); render(); return;
+        }
         var value = target.type === 'checkbox' ? target.checked : target.value;
         if (['duration_seconds', 'steps', 'seed', 'motion_context_frames'].indexOf(field) >= 0) value = Number(value);
         shot[field] = value;
@@ -392,20 +434,33 @@ var H3StudioTab = (function () {
             var eventName = node.tagName === 'TEXTAREA' || node.type === 'text' ? 'input' : 'change';
             node.addEventListener(eventName, function () { setShotField(node.dataset.shotField, node); if (eventName === 'change') render(); });
         });
+        panel.querySelectorAll('[data-endless-field]').forEach(function (node) {
+            var eventName = node.tagName === 'TEXTAREA' ? 'input' : 'change';
+            node.addEventListener(eventName, function () {
+                var field = node.dataset.endlessField;
+                var run = endlessState();
+                run[field] = field === 'continuation_direction' ? node.value : Number(node.value);
+                if (field === 'target_seconds') { run.target_frames = Math.round(run.target_seconds * C.NATIVE_FPS); run.target_seconds = run.target_frames / C.NATIVE_FPS; }
+                if (field === 'segment_seconds') { run.segment_frames = Math.round(run.segment_seconds * C.NATIVE_FPS); run.segment_seconds = run.segment_frames / C.NATIVE_FPS; }
+                run.error = '';
+                saveProject();
+            });
+        });
         panel.querySelectorAll('[data-ref-field]').forEach(function (node) {
             node.addEventListener(node.tagName === 'INPUT' ? 'input' : 'change', function () {
+                if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base references are immutable during the active run.', 'error'); render(); return; }
                 var index = Number(node.dataset.refIndex); var value = node.dataset.refField === 'duration_seconds' ? Number(node.value) : node.value;
                 selectedShot().references[index][node.dataset.refField] = value; selectedShot().prompt_override = ''; saveProject();
             });
         });
         panel.querySelectorAll('[data-ref-move]').forEach(function (node) { node.addEventListener('click', function () { moveReference(Number(node.dataset.refIndex), Number(node.dataset.refMove)); }); });
-        panel.querySelectorAll('[data-ref-remove]').forEach(function (node) { node.addEventListener('click', function () { selectedShot().references.splice(Number(node.dataset.refRemove), 1); selectedShot().prompt_override = ''; saveProject(); render(); }); });
+        panel.querySelectorAll('[data-ref-remove]').forEach(function (node) { node.addEventListener('click', function () { if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base references are immutable during the active run.', 'error'); return; } selectedShot().references.splice(Number(node.dataset.refRemove), 1); selectedShot().prompt_override = ''; saveProject(); render(); }); });
         panel.querySelectorAll('[data-asset-remove]').forEach(function (node) { node.addEventListener('click', function () { state.project.assets.splice(Number(node.dataset.assetRemove), 1); saveProject(); render(); }); });
         panel.querySelectorAll('[data-h3-action]').forEach(function (node) { node.addEventListener('click', function () { handleAction(node.dataset.h3Action); }); });
         var projectTitle = document.getElementById('h3s-project-title');
         if (projectTitle) projectTitle.addEventListener('input', function () { state.project.title = projectTitle.value; saveProject(); });
         var resolution = document.getElementById('h3s-resolution');
-        if (resolution) resolution.addEventListener('change', function () { var parts = resolution.value.split('x'); selectedShot().width = Number(parts[0]); selectedShot().height = Number(parts[1]); saveProject(); render(); });
+        if (resolution) resolution.addEventListener('change', function () { if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base dimensions are immutable during the active run.', 'error'); render(); return; } var parts = resolution.value.split('x'); selectedShot().width = Number(parts[0]); selectedShot().height = Number(parts[1]); saveProject(); render(); });
         var action = document.getElementById('h3s-director-action');
         if (action) action.addEventListener('change', function () { state.directorAction = action.value; state.requestJson = ''; render(); });
         var panels = document.getElementById('h3s-character-panels');
@@ -416,6 +471,7 @@ var H3StudioTab = (function () {
     }
 
     function moveReference(index, delta) {
+        if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base references are immutable during the active run.', 'error'); return; }
         var refs = selectedShot().references, target = index + delta;
         if (target < 0 || target >= refs.length) return;
         var item = refs.splice(index, 1)[0]; refs.splice(target, 0, item); selectedShot().prompt_override = ''; saveProject(); render();
@@ -439,6 +495,7 @@ var H3StudioTab = (function () {
 
     function uploadSingle(file, field) {
         if (!file) return;
+        if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base inputs are immutable during the active run.', 'error'); return; }
         setStatus('Uploading ' + file.name + '…', 'live');
         SerenityAPI.uploadMediaDetails(file).then(function (data) {
             selectedShot()[field] = data.path || data.name || '';
@@ -448,6 +505,7 @@ var H3StudioTab = (function () {
 
     function uploadReferences(files) {
         if (!files.length) return;
+        if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base references are immutable during the active run.', 'error'); return; }
         setStatus('Uploading ' + files.length + ' reference file(s)…', 'live');
         var chain = Promise.resolve();
         files.forEach(function (file) {
@@ -480,7 +538,7 @@ var H3StudioTab = (function () {
         else if (action === 'delete-shot') deleteShot();
         else if (action === 'shot-left') moveShot(-1);
         else if (action === 'shot-right') moveShot(1);
-        else if (action === 'compile-prompt') { selectedShot().prompt_override = ''; saveProject(); render(); }
+        else if (action === 'compile-prompt') { if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base prompt is immutable during the active run.', 'error'); return; } selectedShot().prompt_override = ''; saveProject(); render(); }
         else if (action === 'prepare-director') prepareDirector();
         else if (action === 'run-director') runDirector();
         else if (action === 'apply-director') applyDirector();
@@ -492,9 +550,15 @@ var H3StudioTab = (function () {
         else if (action === 'upload-asset') document.getElementById('h3s-asset-file').click();
         else if (action === 'render-shot') renderShot();
         else if (action === 'continue-take') continueTake();
+        else if (action === 'start-endless') startEndless();
+        else if (action === 'stop-endless') stopEndless();
+        else if (action === 'reset-endless') resetEndless();
     }
 
     function newProject() {
+        if (['submitting', 'running', 'stopping'].indexOf(endlessState().status) >= 0) {
+            showToast('Stop the active endless story before replacing this project', 'error'); return;
+        }
         if (!window.confirm('Create a new H3 project? Export the current project first if you need a file copy.')) return;
         state.project = C.createProject(); state.selectedShotId = 1; state.requestJson = ''; saveProject('New movie project created'); render();
     }
@@ -508,10 +572,12 @@ var H3StudioTab = (function () {
     }
     function deleteShot() {
         if (state.project.shots.length === 1) { setStatus('A project must keep at least one shot', 'error'); return; }
+        if (endlessChainShotLocked(selectedShot())) { showToast('An active endless chain shot cannot be deleted.', 'error'); return; }
         if (!window.confirm('Delete selected shot from this project?')) return;
         var index = selectedShotIndex(); state.project.shots.splice(index, 1); state.selectedShotId = state.project.shots[Math.min(index, state.project.shots.length - 1)].id; saveProject('Shot deleted'); render();
     }
     function moveShot(delta) {
+        if (endlessChainShotLocked(selectedShot())) { showToast('An active endless chain shot cannot be reordered.', 'error'); return; }
         var index = selectedShotIndex(), target = index + delta; if (target < 0 || target >= state.project.shots.length) return;
         var shot = state.project.shots.splice(index, 1)[0]; state.project.shots.splice(target, 0, shot); saveProject('Shot order updated'); render();
     }
@@ -568,6 +634,7 @@ var H3StudioTab = (function () {
     }
 
     function applyDirector() {
+        if (endlessRunActive()) { showToast('Stop the endless run before applying a Director result to the project.', 'error'); return; }
         var last = state.project.last_director_result;
         var json = directorResultJson();
         if (!json) { showToast('No JSON director result to apply', 'error'); return; }
@@ -600,6 +667,9 @@ var H3StudioTab = (function () {
     }
     function importProject(file) {
         if (!file) return;
+        if (['submitting', 'running', 'stopping'].indexOf(endlessState().status) >= 0) {
+            showToast('Stop the active endless story before importing another project', 'error'); return;
+        }
         file.text().then(function (text) { var project = C.normalizeProject(JSON.parse(text)); state.project = project; state.selectedShotId = project.shots[0].id; state.requestJson = ''; saveProject('Project imported'); render(); })
             .catch(function (error) { setStatus('Project import failed: ' + error.message, 'error'); });
     }
@@ -619,16 +689,257 @@ var H3StudioTab = (function () {
         addShot(); var next = selectedShot(); next.continue_from = jobId; next.motion_context_frames = 22; next.brief = 'Continue naturally from the approved take while preserving identity, motion, camera, lighting, sound and story state.'; next.title = 'Continue ' + shot.title; saveProject('Continuation shot created'); state.inspectorTab = 'shot'; render();
     }
 
+    function endlessBaseShot(run) {
+        return state.project.shots.find(function (shot) { return shot.id === Number(run.base_shot_id); }) || null;
+    }
+
+    function endlessRunActive(run) {
+        return ['submitting', 'running', 'stopping'].indexOf((run || endlessState()).status) >= 0;
+    }
+
+    function baseShotMutationBlocked(shot) {
+        var run = endlessState();
+        return endlessRunActive(run) && shot && Number(shot.id) === Number(run.base_shot_id);
+    }
+
+    function endlessChainShotLocked(shot) {
+        var run = endlessState();
+        return endlessRunActive(run) && shot && ([Number(run.base_shot_id)].concat(run.segment_shot_ids || [])).indexOf(Number(shot.id)) >= 0;
+    }
+
+    function currentEndlessSnapshot(run) {
+        var base = endlessBaseShot(run);
+        if (!base) throw new Error('The base shot for this endless run no longer exists.');
+        return C.endlessBaseSnapshot(base, run.target_seconds, run.segment_seconds, run.continuation_direction);
+    }
+
+    function assertEndlessResumeSafe(run) {
+        if (!run.base_snapshot || !C.endlessSnapshotsEqual(currentEndlessSnapshot(run), run.base_snapshot))
+            throw new Error('Endless resume rejected: the base prompt, inputs, dimensions, inference settings, target, segment length, or continuation direction changed. Reset the run to start from the new settings.');
+    }
+
+    function startEndless() {
+        var draft = endlessState();
+        try {
+            var base = selectedShot();
+            var resolvedAttention = resolvedH3Attention(base);
+            if (base.attention_backend !== resolvedAttention) base.attention_backend = resolvedAttention;
+            var run = C.createEndlessRun(base, draft.target_seconds, draft.segment_seconds, draft.continuation_direction);
+            if (!window.confirm('Queue ' + run.segment_durations.length + ' serial H3 render(s) for ' + C.secondsText(run.target_seconds) + ' seconds total? Each completed segment automatically starts the next GPU job.')) return;
+            state.project.endless = run;
+            state.stageTab = 'endless';
+            saveProject(); render();
+            setStatus('Endless story authorized · preparing segment 1 of ' + run.segment_durations.length, 'live');
+            submitNextEndlessSegment();
+        } catch (error) {
+            setStatus(error.message, 'error'); showToast(error.message, 'error');
+        }
+    }
+
+    function stopEndless() {
+        var run = endlessState();
+        if (['submitting', 'running', 'stopping'].indexOf(run.status) < 0) return;
+        run.status = 'stopping';
+        run.updated_at = new Date().toISOString();
+        if (!run.active_job && !state.endlessSubmitting) {
+            run.status = 'stopped'; run.stopped_at = run.updated_at;
+        }
+        saveProject(); render();
+        setStatus(run.status === 'stopped' ? 'Endless story stopped' : 'Stop requested · the active server job will finish, then no next segment will be submitted', '');
+    }
+
+    function resetEndless() {
+        var run = endlessState();
+        if (['submitting', 'running', 'stopping'].indexOf(run.status) >= 0) {
+            showToast('Use Stop after current before resetting an active run', 'error'); return;
+        }
+        state.endlessPollToken += 1;
+        state.project.endless = C.createEmptyEndless(state.project.target_duration_seconds);
+        saveProject('Endless run reset'); render();
+    }
+
+    function registerEndlessQueue(jobId, run, segmentIndex) {
+        if (typeof QueueTab === 'undefined') return;
+        QueueTab.init();
+        QueueTab.registerPending({
+            promptId: jobId,
+            prompt: run.continuation_direction,
+            model: 'MiniMax H3',
+            queuedAt: Date.now(),
+            batchLabel: state.project.title + ' · Endless ' + (segmentIndex + 1) + '/' + run.segment_durations.length
+        });
+    }
+
+    function submitNextEndlessSegment() {
+        var run = endlessState();
+        if (state.endlessSubmitting || run.active_job) return;
+        if (run.status === 'stopping') {
+            run.status = 'stopped'; run.stopped_at = new Date().toISOString(); saveProject(); render(); return;
+        }
+        if (run.status !== 'running') return;
+        var index = run.completed_job_ids.length;
+        if (index >= run.segment_durations.length) {
+            run.status = 'completed'; run.updated_at = new Date().toISOString(); saveProject(); render(); return;
+        }
+        try {
+            assertEndlessResumeSafe(run);
+            var segmentShot = C.endlessSegmentShot(run, index);
+            var request = C.renderRequest(segmentShot);
+            var expectedSnapshot = C.copy(run.base_snapshot);
+            state.endlessSubmitting = true;
+            run.status = 'submitting'; run.error = ''; run.updated_at = new Date().toISOString();
+            saveProject(); render();
+            setStatus('Submitting endless segment ' + (index + 1) + ' of ' + run.segment_durations.length + '…', 'live');
+            SerenityAPI.postVideo(request).then(function (job) {
+                var current = endlessState();
+                state.endlessSubmitting = false;
+                if (!C.endlessSnapshotsEqual(current.base_snapshot, expectedSnapshot) || ['submitting', 'stopping'].indexOf(current.status) < 0) return;
+                assertEndlessResumeSafe(current);
+                if (!job || !(job.video_id || job.prompt_id)) throw new Error('server did not return a video job id');
+                var videoId = String(job.video_id || job.prompt_id);
+                var urls = C.videoJobUrls(videoId);
+                if (!urls) throw new Error('server returned an invalid video job id');
+                current.active_job = Object.assign({}, urls, {
+                    segment_index: index,
+                    not_found_count: 0,
+                    submitted_at: new Date().toISOString()
+                });
+                if (current.status !== 'stopping') current.status = 'running';
+                current.updated_at = new Date().toISOString();
+                registerEndlessQueue(videoId, current, index);
+                saveProject(); render();
+                setStatus(videoId + ' · endless segment ' + (index + 1) + '/' + current.segment_durations.length + ' queued', 'live');
+                pollEndlessActive();
+            }).catch(function (error) {
+                state.endlessSubmitting = false;
+                var current = endlessState(); current.status = 'failed'; current.error = 'Segment submission failed: ' + error.message; current.updated_at = new Date().toISOString();
+                saveProject(); render(); setStatus(current.error, 'error'); showToast(current.error, 'error');
+            });
+        } catch (error) {
+            state.endlessSubmitting = false;
+            run.status = 'failed'; run.error = error.message; run.updated_at = new Date().toISOString();
+            saveProject(); render(); setStatus(error.message, 'error'); showToast(error.message, 'error');
+        }
+    }
+
+    function recordEndlessSegmentTake(run, segmentIndex, videoId, src) {
+        C.recordEndlessSegmentTake(state.project, run, segmentIndex, videoId, src);
+    }
+
+    function pollEndlessActive() {
+        var run = endlessState();
+        if (!run.active_job) return;
+        var job = C.copy(run.active_job);
+        var safeUrls = C.videoJobUrls(job.video_id);
+        if (!safeUrls) {
+            run.status = 'failed'; run.error = 'Refusing to poll an invalid endless video job id.'; saveProject(); render(); return;
+        }
+        job.status_url = safeUrls.status_url; job.result_url = safeUrls.result_url;
+        var token = ++state.endlessPollToken;
+        function poll() {
+            var current = endlessState();
+            if (token !== state.endlessPollToken || !current.active_job || current.active_job.video_id !== job.video_id) return;
+            fetch(job.status_url, { cache: 'no-store' }).then(function (response) {
+                if (!response.ok) throw new Error('status HTTP ' + response.status);
+                return response.json();
+            }).then(function (status) {
+                var activeRun = endlessState();
+                if (activeRun.active_job && activeRun.active_job.not_found_count) {
+                    activeRun.active_job.not_found_count = 0; saveProject();
+                }
+                var phase = String(status.message || status.phase || 'H3 running');
+                setStatus(job.video_id + ' · endless ' + (job.segment_index + 1) + '/' + activeRun.segment_durations.length + ' · ' + phase, 'live');
+                if (status.state === 'failed' || status.state === 'error') throw new Error(phase);
+                if (status.state !== 'done') { setTimeout(poll, 750); return null; }
+                return fetch(job.result_url, { cache: 'no-store' }).then(function (response) {
+                    if (!response.ok) throw new Error('result HTTP ' + response.status);
+                    return response.json();
+                });
+            }).then(function (manifest) {
+                if (!manifest) return;
+                var activeRun = endlessState();
+                var artifact = String(manifest.mp4_url || manifest.artifact_path || '');
+                var src = manifest.mp4_url || (artifact ? '/out/' + encodeURIComponent(job.video_id) + '/' + encodeURIComponent(artifact.split('/').pop()) : '');
+                if (!src) throw new Error('completed video manifest has no playable MP4');
+                if (activeRun.completed_job_ids.length !== Number(job.segment_index))
+                    throw new Error('Endless completion order no longer matches the saved plan; refusing duplicate submission.');
+                recordEndlessSegmentTake(activeRun, Number(job.segment_index), job.video_id, src);
+                activeRun.completed_job_ids.push(job.video_id);
+                activeRun.completed_output_paths.push(src);
+                activeRun.active_job = null; activeRun.error = ''; activeRun.updated_at = new Date().toISOString();
+                if (activeRun.status === 'stopping') {
+                    activeRun.status = 'stopped'; activeRun.stopped_at = activeRun.updated_at;
+                } else if (activeRun.completed_job_ids.length >= activeRun.segment_durations.length) {
+                    activeRun.status = 'completed';
+                } else {
+                    activeRun.status = 'running';
+                }
+                saveProject(); render();
+                if (activeRun.status === 'completed') {
+                    setStatus('Endless story complete · ' + activeRun.completed_job_ids.length + ' segments ready', '');
+                    showToast('Endless story complete', '');
+                } else if (activeRun.status === 'stopped') {
+                    setStatus('Endless story stopped after ' + activeRun.completed_job_ids.length + ' completed segment(s)', '');
+                } else {
+                    setStatus(job.video_id + ' ready · preparing the next continuation', 'live');
+                    setTimeout(submitNextEndlessSegment, 0);
+                }
+            }).catch(function (error) {
+                if (token !== state.endlessPollToken) return;
+                if (/status HTTP 404/.test(error.message)) {
+                    var missing = endlessState();
+                    if (!missing.active_job) return;
+                    missing.active_job.not_found_count = Math.max(0, Number(missing.active_job.not_found_count) || 0) + 1;
+                    missing.updated_at = new Date().toISOString(); saveProject();
+                    if (missing.active_job.not_found_count < 80) { setTimeout(poll, 750); return; }
+                    error = new Error('status remained unavailable for 60 seconds; preserving ' + job.video_id + ' for Queue inspection');
+                }
+                var failed = endlessState(); failed.status = 'failed'; failed.error = 'Endless segment ' + (Number(job.segment_index) + 1) + ' failed: ' + error.message; failed.updated_at = new Date().toISOString();
+                saveProject(); render(); setStatus(failed.error, 'error'); showToast(failed.error, 'error');
+            });
+        }
+        setTimeout(poll, 300);
+    }
+
+    function resumeEndless() {
+        var run = endlessState();
+        if (['submitting', 'running', 'stopping'].indexOf(run.status) < 0) return;
+        try {
+            assertEndlessResumeSafe(run);
+            if (run.active_job) {
+                setStatus('Resuming status tracking for ' + run.active_job.video_id + '…', 'live');
+                pollEndlessActive();
+            } else if (run.status === 'stopping') {
+                run.status = 'stopped'; run.stopped_at = new Date().toISOString(); saveProject(); render(); setStatus('Endless story stopped', '');
+            } else if (run.status === 'submitting') {
+                run.status = 'failed';
+                run.error = 'The browser reloaded before the server returned a job id. Automatic retry and cancellation are blocked to avoid submitting a duplicate or pretending the server job was cancelled; verify the Queue, then reset this run.';
+                saveProject(); render(); setStatus(run.error, 'error');
+            } else {
+                submitNextEndlessSegment();
+            }
+        } catch (error) {
+            run.status = 'failed'; run.error = error.message; run.updated_at = new Date().toISOString(); saveProject(); render(); setStatus(error.message, 'error');
+        }
+    }
+
     function renderShot() {
         var shot = selectedShot();
+        if (endlessChainShotLocked(shot)) {
+            showToast('The active endless chain owns this shot. Select another shot to queue an independent manual render.', 'error'); return;
+        }
         try {
             var resolvedAttention = resolvedH3Attention(shot);
-            if (shot.attention_backend !== resolvedAttention) {
+            if (shot.attention_backend !== resolvedAttention && !baseShotMutationBlocked(shot)) {
                 shot.attention_backend = resolvedAttention;
                 saveProject('Attention fell back to cU-DNN for this GPU');
                 render();
             }
-            var request = C.renderRequest(shot);
+            var requestShot = shot;
+            if (shot.attention_backend !== resolvedAttention) {
+                requestShot = C.copy(shot); requestShot.attention_backend = resolvedAttention;
+            }
+            var request = C.renderRequest(requestShot);
             if (!window.confirm('Queue one ' + C.secondsText(shot.duration_seconds) + '-second H3 take at ' + shot.width + '×' + shot.height + '? This starts GPU work.')) return;
             setStatus('Submitting H3 take…', 'live');
             SerenityAPI.postVideo(request).then(function (job) {
@@ -683,7 +994,7 @@ var H3StudioTab = (function () {
     function init() {
         if (state.initialized) return;
         state.initialized = true; state.project = loadProject(); state.selectedShotId = state.project.shots[0].id;
-        render(); loadReadiness();
+        render(); loadReadiness(); resumeEndless();
     }
 
     return { init: init, render: render, state: state, contracts: C };

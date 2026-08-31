@@ -11,6 +11,11 @@ var H3ProjectContracts = (function () {
     var NATIVE_FPS = 24;
     var MIN_SECONDS = 5;
     var MAX_SECONDS = 15;
+    var MAX_ENDLESS_SECONDS = 3600;
+    var MIN_SEGMENT_FRAMES = MIN_SECONDS * NATIVE_FPS;
+    var MAX_SEGMENT_FRAMES = MAX_SECONDS * NATIVE_FPS;
+    var MAX_TARGET_FRAMES = MAX_ENDLESS_SECONDS * NATIVE_FPS;
+    var ENDLESS_SCHEMA = 'serenity.h3.endless.v1';
     var MAX_PIXELS = 1032192;
     var QWEN_8B = 'Qwen/Qwen3-VL-8B-Instruct';
     var QWEN_32B = 'Qwen/Qwen3-VL-32B-Instruct';
@@ -113,11 +118,123 @@ var H3ProjectContracts = (function () {
             last_director_result: null,
             assets: [],
             character_sheets: [],
+            endless: createEmptyEndless(120),
             shots: [createShot(1, 'Opening shot')],
             next_asset_id: 1,
             next_shot_id: 2,
             updated_at: new Date().toISOString()
         };
+    }
+
+    function createEmptyEndless(targetSeconds) {
+        var targetFrames = normalizeFrameCount(targetSeconds, MIN_SEGMENT_FRAMES, MAX_TARGET_FRAMES, 120 * NATIVE_FPS);
+        return {
+            schema: ENDLESS_SCHEMA,
+            status: 'idle',
+            target_seconds: targetFrames / NATIVE_FPS,
+            target_frames: targetFrames,
+            segment_seconds: 10,
+            segment_frames: 10 * NATIVE_FPS,
+            continuation_direction: 'Continue the same scene naturally. Preserve identity, vehicles, wardrobe, environment, camera direction, motion, lighting, synchronized sound, and story state.',
+            base_shot_id: 0,
+            segment_durations: [],
+            segment_output_frames: [],
+            completed_job_ids: [],
+            completed_output_paths: [],
+            segment_shot_ids: [],
+            active_job: null,
+            base_snapshot: null,
+            fingerprint: '',
+            error: '',
+            started_at: '',
+            updated_at: '',
+            stopped_at: ''
+        };
+    }
+
+    function normalizeFrameCount(seconds, minimum, maximum, fallback) {
+        var frames = Math.round(Number(seconds) * NATIVE_FPS);
+        if (!Number.isFinite(frames)) frames = fallback;
+        return Math.max(minimum, Math.min(maximum, frames));
+    }
+
+    function videoJobUrls(videoId) {
+        var id = String(videoId || '');
+        if (!/^video-\d+$/.test(id)) return null;
+        var encoded = encodeURIComponent(id);
+        return { video_id: id, status_url: '/out/' + encoded + '/status.json', result_url: '/out/' + encoded + '/result.json' };
+    }
+
+    function normalizeEndless(value, targetSeconds) {
+        var out = Object.assign(createEmptyEndless(targetSeconds), value || {});
+        out.schema = ENDLESS_SCHEMA;
+        out.status = ['idle', 'submitting', 'running', 'stopping', 'stopped', 'completed', 'failed'].indexOf(out.status) >= 0 ? out.status : 'idle';
+        out.target_frames = normalizeFrameCount(
+            value && value.target_frames != null ? Number(value.target_frames) / NATIVE_FPS : out.target_seconds,
+            MIN_SEGMENT_FRAMES, MAX_TARGET_FRAMES,
+            normalizeFrameCount(targetSeconds, MIN_SEGMENT_FRAMES, MAX_TARGET_FRAMES, 120 * NATIVE_FPS));
+        out.segment_frames = normalizeFrameCount(
+            value && value.segment_frames != null ? Number(value.segment_frames) / NATIVE_FPS : out.segment_seconds,
+            MIN_SEGMENT_FRAMES, MAX_SEGMENT_FRAMES, 10 * NATIVE_FPS);
+        out.target_seconds = out.target_frames / NATIVE_FPS;
+        out.segment_seconds = out.segment_frames / NATIVE_FPS;
+        out.base_shot_id = Number(out.base_shot_id) || 0;
+        var planned = Array.isArray(out.segment_output_frames)
+            ? out.segment_output_frames.map(Number)
+            : (Array.isArray(out.segment_durations) ? out.segment_durations.map(function (seconds) { return Math.round(Number(seconds) * NATIVE_FPS); }) : []);
+        var coherentPlan = planned.length > 0 && planned.every(function (frames) {
+            return Number.isInteger(frames) && frames >= MIN_SEGMENT_FRAMES && frames <= MAX_SEGMENT_FRAMES;
+        }) && planned.reduce(function (sum, frames) { return sum + frames; }, 0) === out.target_frames;
+        out.segment_output_frames = coherentPlan ? planned : [];
+        out.segment_durations = out.segment_output_frames.map(function (frames) { return frames / NATIVE_FPS; });
+        out.completed_job_ids = Array.isArray(out.completed_job_ids) ? out.completed_job_ids.map(String) : [];
+        out.completed_output_paths = Array.isArray(out.completed_output_paths) ? out.completed_output_paths.map(String) : [];
+        out.segment_shot_ids = Array.isArray(out.segment_shot_ids) ? out.segment_shot_ids.map(Number) : [];
+        var completionCoherent = out.completed_job_ids.length <= out.segment_output_frames.length &&
+            out.completed_job_ids.every(function (id) { return !!videoJobUrls(id); }) &&
+            out.completed_output_paths.length === out.completed_job_ids.length &&
+            out.segment_shot_ids.length >= out.completed_job_ids.length &&
+            out.segment_shot_ids.slice(0, out.completed_job_ids.length).every(function (id) { return Number.isInteger(id) && id > 0; });
+        if (!completionCoherent) {
+            out.status = 'failed'; out.error = 'Imported endless run has an inconsistent completed segment chain.';
+            out.completed_job_ids = []; out.completed_output_paths = []; out.segment_shot_ids = [];
+        }
+        var rawActive = out.active_job && typeof out.active_job === 'object' ? out.active_job : null;
+        var activeUrls = rawActive ? videoJobUrls(rawActive.video_id) : null;
+        var activeIndex = rawActive ? Number(rawActive.segment_index) : -1;
+        if (rawActive && (!activeUrls || !Number.isInteger(activeIndex) || activeIndex !== out.completed_job_ids.length || activeIndex >= out.segment_output_frames.length)) {
+            out.status = 'failed'; out.error = 'Imported endless run has an invalid active video job.'; rawActive = null;
+        }
+        out.active_job = rawActive ? Object.assign({}, rawActive, activeUrls, {
+            segment_index: activeIndex,
+            not_found_count: Math.max(0, Number(rawActive.not_found_count) || 0)
+        }) : null;
+        out.base_snapshot = out.base_snapshot && typeof out.base_snapshot === 'object' ? out.base_snapshot : null;
+        out.continuation_direction = String(out.continuation_direction || '');
+        out.fingerprint = String(out.fingerprint || '');
+        out.error = String(out.error || '');
+        if (out.active_job && ['submitting', 'running', 'stopping'].indexOf(out.status) < 0) {
+            out.status = 'failed'; out.error = 'Imported endless run has an active job in a terminal state.'; out.active_job = null;
+        }
+        if (['idle', 'failed'].indexOf(out.status) < 0 && (!out.base_snapshot || !out.segment_output_frames.length)) {
+            out.status = 'failed'; out.error = 'Imported endless run is missing its immutable frame plan or base snapshot.'; out.active_job = null;
+        }
+        if (out.status === 'completed' && out.completed_job_ids.length !== out.segment_output_frames.length) {
+            out.status = 'failed'; out.error = 'Imported endless run claims completion without the full frame plan.'; out.active_job = null;
+        }
+        if (out.base_snapshot && out.status !== 'idle') {
+            try {
+                var replay = endlessBaseSnapshot(
+                    Object.assign(createShot(1, 'Imported endless base'), copy(out.base_snapshot.shot || {})),
+                    out.target_seconds, out.segment_seconds, out.continuation_direction);
+                if (!endlessSnapshotsEqual(replay, out.base_snapshot) ||
+                    canonicalEndlessSnapshot(out.segment_output_frames) !== canonicalEndlessSnapshot(out.base_snapshot.segment_output_frames))
+                    throw new Error('snapshot mismatch');
+            } catch (_) {
+                out.status = 'failed'; out.error = 'Imported endless run failed its immutable snapshot contract.'; out.active_job = null;
+            }
+        }
+        return out;
     }
 
     function normalizeReference(value) {
@@ -169,7 +286,228 @@ var H3ProjectContracts = (function () {
             : [createShot(1, 'Opening shot')];
         out.next_shot_id = Number(out.next_shot_id) || (Math.max.apply(null, out.shots.map(function (shot) { return shot.id; })) + 1);
         out.next_asset_id = Number(out.next_asset_id) || 1;
+        out.endless = normalizeEndless(out.endless, out.target_duration_seconds);
+        if (out.endless.completed_job_ids.length) {
+            var completedChainValid = out.endless.completed_job_ids.every(function (jobId, index) {
+                var mapped = out.shots.find(function (shot) { return shot.id === Number(out.endless.segment_shot_ids[index]); });
+                return mapped && mapped.take_job_ids.indexOf(jobId) >= 0 && mapped.selected_take >= 0;
+            });
+            if (!completedChainValid) {
+                out.endless.status = 'failed'; out.endless.error = 'Imported endless run is missing a completed shot from its continuity spine.'; out.endless.active_job = null;
+            }
+        }
+        if (['submitting', 'running', 'stopping'].indexOf(out.endless.status) >= 0) {
+            var endlessBase = out.shots.find(function (shot) { return shot.id === Number(out.endless.base_shot_id); });
+            try {
+                if (!endlessBase || !endlessSnapshotsEqual(
+                    endlessBaseSnapshot(endlessBase, out.endless.target_seconds, out.endless.segment_seconds, out.endless.continuation_direction),
+                    out.endless.base_snapshot)) throw new Error('base mismatch');
+            } catch (_) {
+                out.endless.status = 'failed'; out.endless.error = 'Imported endless run no longer matches its base inference snapshot.'; out.endless.active_job = null;
+            }
+        }
         return out;
+    }
+
+    function validateEndlessSettings(targetSeconds, segmentSeconds, direction) {
+        var target = Number(targetSeconds);
+        var segment = Number(segmentSeconds);
+        if (!Number.isFinite(target) || target < MIN_SECONDS || target > MAX_ENDLESS_SECONDS)
+            return 'Endless target must stay between 5 seconds and 60 minutes.';
+        if (!Number.isFinite(segment) || segment < MIN_SECONDS || segment > MAX_SECONDS)
+            return 'Each endless segment must stay between 5 and 15 seconds.';
+        if (!String(direction || '').trim())
+            return 'Write an explicit continuation direction before starting.';
+        return '';
+    }
+
+    function planEndlessDurations(targetSeconds, segmentSeconds) {
+        var issue = validateEndlessSettings(targetSeconds, segmentSeconds, 'direction');
+        if (issue) throw new Error(issue);
+        return planEndlessFrames(targetSeconds, segmentSeconds).map(function (frames) { return frames / NATIVE_FPS; });
+    }
+
+    function planEndlessFrames(targetSeconds, segmentSeconds) {
+        var issue = validateEndlessSettings(targetSeconds, segmentSeconds, 'direction');
+        if (issue) throw new Error(issue);
+        var target = Math.round(Number(targetSeconds) * NATIVE_FPS);
+        var preferred = Math.round(Number(segmentSeconds) * NATIVE_FPS);
+        var count = Math.ceil(target / preferred);
+        count = Math.min(count, Math.floor(target / MIN_SEGMENT_FRAMES));
+        count = Math.max(count, Math.ceil(target / MAX_SEGMENT_FRAMES), 1);
+        var remaining = target;
+        var frames = [];
+        for (var i = 0; i < count; i++) {
+            var slots = count - i - 1;
+            var low = Math.max(MIN_SEGMENT_FRAMES, remaining - slots * MAX_SEGMENT_FRAMES);
+            var high = Math.min(MAX_SEGMENT_FRAMES, remaining - slots * MIN_SEGMENT_FRAMES);
+            var next = Math.max(low, Math.min(high, preferred));
+            frames.push(next); remaining -= next;
+        }
+        if (remaining !== 0 || frames.some(function (value) { return !Number.isInteger(value) || value < MIN_SEGMENT_FRAMES || value > MAX_SEGMENT_FRAMES; }))
+            throw new Error('Endless duration cannot be divided into valid 120–360 frame H3 segments.');
+        return frames;
+    }
+
+    function stableValue(value) {
+        if (Array.isArray(value)) return value.map(stableValue);
+        if (value && typeof value === 'object') {
+            var out = {};
+            Object.keys(value).sort().forEach(function (key) { out[key] = stableValue(value[key]); });
+            return out;
+        }
+        return value;
+    }
+
+    function endlessFingerprint(snapshot) {
+        var text = canonicalEndlessSnapshot(snapshot);
+        var hash = 2166136261;
+        for (var i = 0; i < text.length; i++) {
+            hash ^= text.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        return 'fnv1a32-' + (hash >>> 0).toString(16).padStart(8, '0');
+    }
+
+    function canonicalEndlessSnapshot(snapshot) {
+        return JSON.stringify(stableValue(snapshot));
+    }
+
+    function endlessSnapshotsEqual(left, right) {
+        return canonicalEndlessSnapshot(left) === canonicalEndlessSnapshot(right);
+    }
+
+    function endlessBaseSnapshot(shot, targetSeconds, segmentSeconds, direction) {
+        var issue = validateEndlessSettings(targetSeconds, segmentSeconds, direction);
+        if (issue) throw new Error(issue);
+        var frames = planEndlessFrames(targetSeconds, segmentSeconds);
+        var durations = frames.map(function (value) { return value / NATIVE_FPS; });
+        var base = {
+            width: Number(shot.width), height: Number(shot.height),
+            steps: Number(shot.steps), seed: Number(shot.seed), quant: String(shot.quant || ''),
+            attention_backend: String(shot.attention_backend || ''), step_cache: String(shot.step_cache || ''),
+            brief: String(shot.brief || ''), shot_description: String(shot.shot_description || ''),
+            soundscape: String(shot.soundscape || ''), music: String(shot.music || ''),
+            subject_definitions: String(shot.subject_definitions || ''), summary: String(shot.summary || ''),
+            retention_analysis: String(shot.retention_analysis || ''), prompt_override: String(shot.prompt_override || ''),
+            first_frame: String(shot.first_frame || ''), last_frame: String(shot.last_frame || ''),
+            continue_from: String(shot.continue_from || ''), motion_context_frames: Number(shot.motion_context_frames) || 22,
+            references: Array.isArray(shot.references) ? shot.references.map(copy) : []
+        };
+        var first = Object.assign(createShot(base.id, base.title), copy(base));
+        first.duration_seconds = durations[0];
+        var shotIssue = validateShot(first);
+        if (shotIssue) throw new Error(shotIssue);
+        return {
+            schema: ENDLESS_SCHEMA,
+            target_frames: frames.reduce(function (sum, value) { return sum + value; }, 0),
+            segment_frames: Math.round(Number(segmentSeconds) * NATIVE_FPS),
+            segment_output_frames: frames,
+            target_seconds: frames.reduce(function (sum, value) { return sum + value; }, 0) / NATIVE_FPS,
+            segment_seconds: Math.round(Number(segmentSeconds) * NATIVE_FPS) / NATIVE_FPS,
+            segment_durations: durations,
+            continuation_direction: String(direction).trim(),
+            first_segment_mode: detectMode(first), first_segment_prompt: compilePrompt(first),
+            shot: base
+        };
+    }
+
+    function createEndlessRun(shot, targetSeconds, segmentSeconds, direction) {
+        var snapshot = endlessBaseSnapshot(shot, targetSeconds, segmentSeconds, direction);
+        var out = createEmptyEndless(targetSeconds);
+        out.status = 'running';
+        out.target_seconds = snapshot.target_seconds;
+        out.target_frames = snapshot.target_frames;
+        out.segment_seconds = snapshot.segment_seconds;
+        out.segment_frames = snapshot.segment_frames;
+        out.continuation_direction = snapshot.continuation_direction;
+        out.base_shot_id = Number(shot.id);
+        out.segment_durations = snapshot.segment_durations.slice();
+        out.segment_output_frames = snapshot.segment_output_frames.slice();
+        out.base_snapshot = snapshot;
+        out.fingerprint = endlessFingerprint(snapshot);
+        out.started_at = new Date().toISOString();
+        out.updated_at = out.started_at;
+        for (var i = 0; i < out.segment_output_frames.length; i++) {
+            var probe = copy(out);
+            probe.completed_job_ids = [];
+            for (var j = 0; j < i; j++) probe.completed_job_ids.push('video-' + String(j + 1).padStart(4, '0'));
+            renderRequest(endlessSegmentShot(probe, i));
+        }
+        return out;
+    }
+
+    function endlessSegmentShot(run, segmentIndex) {
+        if (!run || !run.base_snapshot || !run.base_snapshot.shot)
+            throw new Error('Endless run has no saved base snapshot.');
+        var index = Number(segmentIndex);
+        if (!Number.isInteger(index) || index < 0 || index >= run.segment_durations.length)
+            throw new Error('Endless segment index is outside the saved plan.');
+        var base = run.base_snapshot.shot;
+        var shot;
+        if (index === 0) {
+            shot = Object.assign(createShot(run.base_shot_id, 'Endless opening'), copy(base));
+        } else {
+            shot = Object.assign(createShot(0, 'Endless continuation ' + (index + 1)), copy(base));
+            shot.width = Number(base.width); shot.height = Number(base.height);
+            shot.steps = Number(base.steps); shot.quant = base.quant;
+            shot.attention_backend = base.attention_backend; shot.step_cache = base.step_cache;
+            shot.brief = run.continuation_direction;
+            shot.shot_description = run.continuation_direction;
+            shot.soundscape = base.soundscape; shot.music = base.music;
+            shot.references = Array.isArray(base.references) ? base.references.map(copy) : [];
+            shot.prompt_override = '';
+            shot.first_frame = ''; shot.last_frame = '';
+            shot.continue_from = run.completed_job_ids[index - 1] || '';
+            shot.motion_context_frames = 22;
+        }
+        shot.duration_seconds = Number(run.segment_output_frames[index]) / NATIVE_FPS;
+        shot.seed = (Number(base.seed) + index) >>> 0;
+        return shot;
+    }
+
+    function recordEndlessSegmentTake(project, run, segmentIndex, videoId, src) {
+        var urls = videoJobUrls(videoId);
+        if (!urls) throw new Error('Endless completion has an invalid video job id.');
+        var index = Number(segmentIndex);
+        if (!Number.isInteger(index) || index < 0 || index >= run.segment_output_frames.length)
+            throw new Error('Endless completion is outside the saved frame plan.');
+        var base = project.shots.find(function (item) { return item.id === Number(run.base_shot_id); });
+        if (!base) throw new Error('The base shot for this endless run no longer exists.');
+        var generated = endlessSegmentShot(run, index);
+        var shot;
+        if (index === 0) {
+            shot = base;
+            generated.id = shot.id; generated.title = shot.title;
+        } else {
+            var mappedId = Number(run.segment_shot_ids[index]);
+            shot = project.shots.find(function (item) { return item.id === mappedId; }) || null;
+            if (!shot) {
+                generated.id = project.next_shot_id++;
+                var previousId = Number(run.segment_shot_ids[index - 1] || run.base_shot_id);
+                var previousIndex = project.shots.findIndex(function (item) { return item.id === previousId; });
+                if (previousIndex < 0) throw new Error('The prior endless shot is missing from the continuity spine.');
+                shot = generated;
+                project.shots.splice(previousIndex + 1, 0, shot);
+            }
+            generated.id = shot.id;
+            generated.title = base.title + ' · continuation ' + (index + 1);
+        }
+        var takeIds = Array.isArray(shot.take_job_ids) ? shot.take_job_ids : [];
+        var takeStates = Array.isArray(shot.take_states) ? shot.take_states : [];
+        var takePaths = Array.isArray(shot.take_output_paths) ? shot.take_output_paths : [];
+        Object.assign(shot, generated);
+        shot.take_job_ids = takeIds; shot.take_states = takeStates; shot.take_output_paths = takePaths;
+        var take = shot.take_job_ids.indexOf(urls.video_id);
+        if (take < 0) {
+            shot.take_job_ids.push(urls.video_id); shot.take_states.push('done'); shot.take_output_paths.push(String(src || ''));
+            take = shot.take_job_ids.length - 1;
+        } else {
+            shot.take_states[take] = 'done'; shot.take_output_paths[take] = String(src || '');
+        }
+        shot.selected_take = take; shot.status = 'Ready'; shot.output_path = String(src || '');
+        run.segment_shot_ids[index] = shot.id;
+        return shot;
     }
 
     function projectKindLabel(kind) {
@@ -620,6 +958,8 @@ var H3ProjectContracts = (function () {
         NATIVE_FPS: NATIVE_FPS,
         MIN_SECONDS: MIN_SECONDS,
         MAX_SECONDS: MAX_SECONDS,
+        MAX_ENDLESS_SECONDS: MAX_ENDLESS_SECONDS,
+        ENDLESS_SCHEMA: ENDLESS_SCHEMA,
         MAX_PIXELS: MAX_PIXELS,
         RESOLUTIONS: RESOLUTIONS,
         ACTIONS: ACTIONS,
@@ -628,6 +968,8 @@ var H3ProjectContracts = (function () {
         createReference: createReference,
         createShot: createShot,
         createProject: createProject,
+        createEmptyEndless: createEmptyEndless,
+        createEndlessRun: createEndlessRun,
         normalizeProject: normalizeProject,
         copy: copy,
         secondsText: secondsText,
@@ -642,6 +984,16 @@ var H3ProjectContracts = (function () {
         promptComplianceIssue: promptComplianceIssue,
         validateShot: validateShot,
         renderRequest: renderRequest,
+        validateEndlessSettings: validateEndlessSettings,
+        planEndlessDurations: planEndlessDurations,
+        planEndlessFrames: planEndlessFrames,
+        endlessBaseSnapshot: endlessBaseSnapshot,
+        endlessFingerprint: endlessFingerprint,
+        canonicalEndlessSnapshot: canonicalEndlessSnapshot,
+        endlessSnapshotsEqual: endlessSnapshotsEqual,
+        videoJobUrls: videoJobUrls,
+        endlessSegmentShot: endlessSegmentShot,
+        recordEndlessSegmentTake: recordEndlessSegmentTake,
         directorMinimumShots: directorMinimumShots,
         directorMaximumShots: directorMaximumShots,
         actionById: actionById,

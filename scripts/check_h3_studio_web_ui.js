@@ -86,6 +86,20 @@ async function run() {
     assert(initial.bodyWidth <= 1920, `desktop page overflows viewport: ${initial.bodyWidth}px`);
     assert(videoPosts === 0, "opening H3 Studio launched a video request");
 
+    await page.locator('[data-stage-tab="endless"]').click();
+    const endlessCopy = await page.locator(".h3s-endless-card").textContent();
+    assert(endlessCopy.includes("inference only") && endlessCopy.includes("browser never rebuilds model state or starts training"),
+      "Endless inference-only/no-training contract is not visible");
+    await page.locator('[data-endless-field="target_seconds"]').fill("31");
+    await page.locator('[data-endless-field="target_seconds"]').press("Tab");
+    await page.locator('[data-endless-field="segment_seconds"]').fill("15");
+    await page.locator('[data-endless-field="segment_seconds"]').press("Tab");
+    const endlessDraft = await page.evaluate(() => H3StudioTab.state.project.endless);
+    assert(endlessDraft.target_frames === 744 && endlessDraft.segment_frames === 360,
+      `Endless draft is not frame-aligned: ${JSON.stringify(endlessDraft)}`);
+    assert(videoPosts === 0, "configuring Endless launched GPU work without Start confirmation");
+    await page.locator('[data-stage-tab="director"]').click();
+
     const directorInput = page.locator('.h3s-stage [data-project-field="director_brief"]');
     await directorInput.fill("A two-minute love story: two people meet under odd circumstances, collide in funny recurring scenes, and finally click.");
     await page.locator('[data-h3-action="prepare-director"]').click();
@@ -109,6 +123,9 @@ async function run() {
     await page.locator("#panel-h3-studio .h3s-app").waitFor({ state: "visible" });
     assert(await page.locator("#h3s-project-title").inputValue() === "Odd Terms", "project title did not persist");
     assert(await page.locator(".h3s-shot-card").count() === 2, "shot deck did not persist");
+    const persistedEndless = await page.evaluate(() => H3StudioTab.state.project.endless);
+    assert(persistedEndless.target_frames === 744 && persistedEndless.segment_frames === 360,
+      "frame-aligned Endless draft did not persist");
     assert(videoPosts === 0, "reload launched GPU work");
 
     const artifactDir = path.join(process.cwd(), "output", "checks", "h3_studio_web");

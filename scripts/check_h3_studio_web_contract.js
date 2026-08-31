@@ -127,6 +127,9 @@ const roundTrip = C.normalizeProject(JSON.parse(JSON.stringify(project)));
 must(roundTrip.schema === project.schema && roundTrip.shots.length === project.shots.length, 'project round-trip failed');
 const edit = C.deliveryManifest(project);
 must(edit.schema === 'serenity.h3.edit.v1' && edit.source_fps === 24, 'edit manifest drift');
+const endlessFrames = Array.from(C.planEndlessFrames(31, 15));
+must(JSON.stringify(endlessFrames) === JSON.stringify([360, 264, 120]), 'Endless exact 24-fps frame plan drift');
+must(endlessFrames.reduce((sum, frames) => sum + frames, 0) === 31 * 24, 'Endless plan does not cover the target exactly');
 
 const index = fs.readFileSync(indexPath, 'utf8');
 const studio = fs.readFileSync(studioPath, 'utf8');
@@ -138,6 +141,9 @@ must(studio.includes('resolvedH3Attention(shot)'), 'H3 Studio does not consume s
 must(!studio.includes('CK INT8 · fastest'), 'H3 Studio still makes a universal fastest claim');
 must(studio.includes("window.confirm('Queue one "), 'GPU render must require explicit confirmation');
 must(studio.includes('opening Studio never starts GPU work'), 'no-auto-generation status missing');
+must(studio.includes('Start endless story') && studio.includes('Stop after current'), 'Endless explicit controls missing');
+must(studio.includes('C.videoJobUrls') && studio.includes('C.endlessSnapshotsEqual'), 'Endless safe resume/URL reconstruction missing');
+must(studio.includes('browser never rebuilds model state or starts training'), 'Endless inference-only contract missing');
 must(studio.includes('Continuity spine') && studio.includes('Prepare Qwen Director pass'), 'filmmaker workspace surfaces missing');
 must(css.includes('.h3s-workspace') && css.includes('.h3s-spine-shot') && css.includes('@media (prefers-reduced-motion: reduce)'), 'film layout/accessibility CSS missing');
 const shell = fs.readFileSync(path.join(root, 'serenity-server/canvas/js/shell.js'), 'utf8');

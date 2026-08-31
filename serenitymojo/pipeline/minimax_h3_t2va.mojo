@@ -1114,6 +1114,9 @@ def _minimax_h3_mux_av(
     `-skip_initial_bytes` (frame size is constant), not a timestamp seek."""
     if trim_start_frames < 0:
         raise Error("MiniMax-H3 trim-start frames cannot be negative")
+    if output_fps < 1:
+        raise Error("MiniMax-H3 output fps must be positive")
+    var output_seconds = Float64(frames) / Float64(output_fps)
     var mp4 = out_dir + String("/video.mp4")
     var cmd = String("ffmpeg -v error -y -f rawvideo -pixel_format rgb24")
     cmd += String(" -video_size ") + String(width) + String("x") + String(height)
@@ -1132,7 +1135,13 @@ def _minimax_h3_mux_av(
     if output_fps != input_fps:
         cmd += String(" -vf fps=") + String(output_fps)
     cmd += String(" -frames:v ") + String(frames)
-    var tail = String(" -pix_fmt yuv420p -af apad -c:a aac -shortest")
+    # `-frames:v` is not an A/V duration boundary: ffmpeg can keep encoding the
+    # longer generated waveform after the last video frame even with
+    # `-shortest`.  Bound both the audio filter and the output container to the
+    # authored video duration so every Endless segment has an exact seam.
+    var tail = String(" -pix_fmt yuv420p -af apad,atrim=duration=")
+    tail += String(output_seconds) + String(" -c:a aac -t ")
+    tail += String(output_seconds)
     tail += String(" -movflags +faststart ") + shell_quote(mp4)
     var nv = cmd + String(
         " -c:v h264_nvenc -preset p7 -tune hq -rc vbr -cq 18 -b:v 0"

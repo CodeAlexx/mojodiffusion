@@ -6,6 +6,19 @@ browser application in this repository. The browser source is
 HTTP, WebSocket, queues, graph lowering, GPU leases, and Mojo worker lifecycle.
 Model execution remains in the Mojo workers under `output/bin/`.
 
+## Serenity Studio surfaces
+
+Serenity Studio is one checked-in browser application with eight screens:
+Generate, Canvas, Workflows, Video Edit, H3 Studio, Models, Queue, and Settings.
+Generate handles capability-admitted image and selected video generation;
+Canvas owns layers, masks, inpainting, source-image work, and conditioned-video
+staging; Workflows is the Comfy-compatible graph editor; Video Edit is the
+isolated Genesis compositor; H3 Studio is the project-based MiniMax H3
+filmmaking workspace; Models inventories installed checkpoints and components;
+Queue presents server jobs; and Settings owns local application and path
+configuration. Rust supplies control-plane routes and process supervision.
+Learned model execution remains Mojo-native.
+
 The live job driver never terminates a generation because `/proc/<pid>/io`
 reports physical reads during sampling. Disk-read assertions are profiling and
 performance evidence, not a user-facing completion gate; worker failures,
@@ -26,6 +39,63 @@ benchmark reports, product-gate JSON, conditioning caches, modulation caches,
 and INT8 resident caches do not hide or disable the model. BF16 starts directly;
 the first INT8 or INT8 Fast request builds its selected acceleration cache in a
 separate GPU-only phase, then reuses that cache on later requests.
+
+## H3 Studio, continuation, and Endless
+
+H3 Studio is available at `/?tab=h3-studio`. It persists
+`serenity.h3.movie.v1` projects in browser localStorage and supports briefs,
+shot plans, H3 prompts, Qwen Director workflows, ordered image/video/audio
+references, character-sheet planning, individual takes, native continuation,
+an editable continuity spine, and delivery-manifest export. Preparing a
+Director request is CPU-only; running the Director uses the Mojo Qwen3-VL
+captioner through `/v1/h3/director`; rendering uses `/v1/video`. Opening Studio
+does not start GPU work.
+
+Native continuation requires a completed local `video-NNNN` result at the same
+resolution. The server reuses its retained `motion_context.safetensors` tail,
+accepts 5, 22, or 39 context frames, and trims the selected overlap from
+delivery. Model execution is Mojo-native; Rust validates the request, leases
+the GPU, supervises the processes, and publishes status/results.
+
+The H3 Studio Endless tab is a browser-owned serial coordinator over those
+ordinary `/v1/video` continuation jobs. It accepts a 5–3600-second target and a
+5–15-second preferred segment size, builds an immutable exact-24-FPS plan,
+increments the seed per segment, preserves the base prompt/settings/references,
+and starts a successor only after the current result completes. Stop means
+finish the active segment and submit no successor. Reload resumes a known job;
+an ambiguous reload during submission fails closed to avoid duplicate work.
+Completed segments become ordinary shots in the continuity spine and delivery
+manifest. This path does not invoke `/v1/train` or modify trainer state.
+
+### SerenityFlow endless workflow runner
+
+Separately, `output/bin/minimax_h3_endless` is the local Mojo inference intake
+for the supported SerenityFlow `MiniMaxH3EndlessLatent` and
+`MiniMaxH3EndlessSampler` API-prompt subset. It is not currently a `/v1/video`
+route or browser Workflow node. Its planner snaps the internal target to H3's
+`17k+5` grid, carries a separate native reference tail, protects an exact A/V
+boundary on every continuation, appends only new suffix frames, fingerprints
+the inference recipe, verifies completed chunk artifacts, atomically
+checkpoints, and emits an exact-duration H.264/AAC result. Learned model
+execution is Mojo-native; FFmpeg performs mux and assembly.
+
+Build and inspect the plan locally:
+
+```bash
+H3_REBUILD_PROFILES=1 scripts/build_minimax_h3_video_profiles.sh
+scripts/build_minimax_h3_endless.sh
+
+output/bin/minimax_h3_endless \
+  serenitymojo/configs/minimax_h3_endless_story.json \
+  output/run_serenity_ui/h3-endless \
+  --quant=bf16 \
+  --attention-backend=cudnn \
+  --plan-only
+```
+
+Removing `--plan-only` starts GPU inference and requires the ordinary H3 model,
+runtime, and linked-library prerequisites. The exact evidence and limits are
+recorded in `../serenitymojo/MAP.md` under the 2026-08-30 H3 Endless entry.
 
 The browser Video Edit tab is the one deliberate exception to that execution
 architecture: it uses the vendored Genesis Rust/C/FFmpeg/OpenCL compositor as a
@@ -226,6 +296,20 @@ falls back to editable project settings when there is no clip selection.
 
 ## Verify the desktop-style Generate screen
 
+Before the broad Generate checks, verify the non-generating H3 Studio contract:
+
+```bash
+node serenity-server/canvas/js/h3-endless.test.js
+node scripts/check_h3_studio_web_contract.js
+
+SERENITY_BASE_URL=http://127.0.0.1:7811 \
+  node scripts/check_h3_studio_web_ui.js
+```
+
+The browser check covers the mounted workspace, Director preparation, Endless
+controls/persistence, fail-closed readiness, and zero `/v1/video` submissions.
+It does not perform generation.
+
 Generate is a capability-driven image and admitted text-to-video workspace:
 filterable parameters on the left, a large result viewer in the center, Current
 Batch on the right, the prompt and Generate action below the viewer, and
@@ -253,7 +337,7 @@ model filtering, Krea parameter reuse, Z-Image's sampler/scheduler surfaces,
 exact Generate-to-Workflow values, admitted LTX/Sulphur/WAN profiles, identical
 image preflight/generate bodies, and the flat `/v1/generate` request. The full
 design and current real-generation evidence are recorded in
-`../docs/SERENITY_GENERATE_UI_2026-07-24.md`. The shared resolution ladder those "compiled resolution choices" come from — the one `serenitymojo/training/aspect_buckets.mojo` file every image backend derives its valid sizes from, and how the Generate tab hydrates them via `/v1/capabilities` — is mapped in `../../serenitymojo/MAP.md` (2026-08-22: SERENITY GENERATE UI + SHARED RESOLUTION LADDER).
+`../docs/SERENITY_GENERATE_UI_2026-07-24.md`. The shared resolution ladder those "compiled resolution choices" come from — the one `serenitymojo/training/aspect_buckets.mojo` file every image backend derives its valid sizes from, and how the Generate tab hydrates them via `/v1/capabilities` — is mapped in `../serenitymojo/MAP.md` (2026-08-22: SERENITY GENERATE UI + SHARED RESOLUTION LADDER).
 
 To inspect a particular persisted project through the same browser gate:
 

@@ -125,7 +125,7 @@ compatibility unless a separately reviewed contract migration changes them.
   `SetLatentNoiseMask`, `LanPaint_KSamplerAdvanced`, decode, and final mask
   blend. This prepares missing-model work for another machine without
   downloading weights here or weakening `/v1/preflight`. The authoritative
-  matrix is `docs/SERENITY_LANPAINT_MODEL_MATRIX_2026-07-22.md`.
+  matrix is `../../docs/SERENITY_LANPAINT_MODEL_MATRIX_2026-07-22.md`.
 - Krea2 LanPaint Regenerate reuses conditioning bins, the normalized source
   latent and blend pixels, and the matching int8 DiT only while their explicit
   prompt, source path, Raw/Turbo checkpoint, and residency keys remain equal.
@@ -157,6 +157,38 @@ compatibility unless a separately reviewed contract migration changes them.
   measured-safe Z-Image resident worker, reaps incompatible high-memory workers,
   and fails with a visible conflict if generation is active; SAM3 itself remains
   the isolated service on port 7812.
+
+## H3 Studio behavior
+
+- H3 Studio is the project-based MiniMax H3 filmmaker mounted at
+  `/?tab=h3-studio`. Project state uses schema `serenity.h3.movie.v1` and
+  browser localStorage key `serenity-h3-current-project-v1`; there is no
+  server-side H3 project store. JSON export/import is the durable transfer seam.
+- Task precedence is fixed: native continuation, ordered references,
+  first+last frame, first frame, last frame, then text-only. Every render
+  preserves the selected prompt, dimensions, steps, seed, quantization,
+  attention backend, cache policy, references, synchronized audio, and authored
+  output-frame count.
+- Native continuation accepts only a completed local `video-NNNN` at the same
+  resolution. It reuses native video/audio motion context, accepts 5/22/39-frame
+  windows, and trims the selected overlap from delivery.
+- The Endless controller is inference-only and serial. It plans exact 24-FPS
+  output segments between 120 and 360 frames, persists schema
+  `serenity.h3.endless.v1`, increments the seed by segment index, carries
+  references and continuation direction, and submits the next `/v1/video`
+  request only after the prior result is complete.
+- An active Endless run freezes its canonical base inference snapshot and
+  continuity-spine shots. Resume requires full canonical equality rather than
+  trusting the display fingerprint. Invalid imported jobs, missing chain shots,
+  changed inference inputs, out-of-order completion, and ambiguous
+  reload-during-submit states fail closed.
+- Stop does not pretend to cancel an already submitted GPU job: the current
+  segment may finish, and no successor is submitted. Reset is unavailable while
+  the chain is active.
+- The browser Endless coordinator and standalone Mojo
+  `MiniMaxH3EndlessSampler` workflow runner are separate entry points. Browser
+  code must not claim it submitted the standalone runner unless an explicit
+  reviewed API integration is added.
 
 ## Workflow canvas behavior
 

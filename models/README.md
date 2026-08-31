@@ -6,6 +6,9 @@ may be real installations or installer-managed links to another disk:
 
 ```text
 models/
+  checkpoints/
+  loras/
+  wildcards/
   anima/
   chroma/
   flux1-dev/
@@ -42,6 +45,9 @@ models/
   zimage/
 ```
 
+`checkpoints/`, `loras/`, and `wildcards/` are installation roots created by
+`scripts/setup.sh`; their generated/model payloads remain untracked.
+
 SCAIL-2 uses the shared Serenity registry because its official, converted, and
 reused artifacts span multiple checkpoint directories:
 
@@ -57,6 +63,40 @@ $SERENITY_MODEL_ROOT/
     Wan2.2-TI2V-5B-Mojo/umt5/
     Bernini-R-Diffusers/vae/diffusion_pytorch_model.safetensors
 ```
+
+MiniMax H3 likewise uses the shared registry. Its inference sources currently
+compile the default per-user location directly, so setting
+`SERENITY_MODEL_ROOT` changes server discovery but does not retarget those
+compiled H3 paths:
+
+```text
+$SERENITY_MODEL_ROOT/
+  checkpoints/
+    MiniMax-H3/
+      FL2VA/
+        transformer/
+          model.safetensors.index.json
+          ...checkpoint shards...
+        text_encoder/
+        processor/
+        audio_vae/model.safetensors
+        video_vae/source/
+        serenity_runtime_cache_v1/   # generated on demand
+      Ref2VA/
+        transformer/
+        text_encoder/
+        processor/
+        tokenizer/
+        audio_vae/model.safetensors
+        video_vae/source/
+        serenity_runtime_cache_v1/   # generated on demand
+```
+
+The bounded LTX 2/2.3, Wan 2.2, Bernini-R, and SCAIL-2 layouts evolve with
+their pinned workflow/model revisions. Their authoritative runtime paths and
+missing-artifact gates live in `serenity-server/crates/server/src/video/`
+(`ltx2.rs`, `wan22.rs`, `bernini.rs`, `scail2.rs`, and `minimax_h3.rs`). Do not
+infer readiness from a nearby filename or copy an artifact between families.
 
 When `SERENITY_MODEL_ROOT` is unset, this is
 `$SERENITY_HOME/models` or `~/.serenity/models`. `pixi run build-scail2` builds

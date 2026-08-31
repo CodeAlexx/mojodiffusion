@@ -3186,7 +3186,7 @@ mv2v [+ads2v]) — task chosen by env `BERNINI_TASK` (default t2v).
   live status prioritized the text-encoder store; that smoke was cancelled
   rather than claiming a complete 122-GB warm.
 
-## §5 MiniMax-H3 (t2va + i2va + omni-ref2va; updated 2026-08-20)
+## §5 MiniMax-H3 (t2va + i2va + omni-ref2va; updated 2026-08-30)
 
 The 33.1B joint audio-video DiT, pure-Mojo, native FL2VA/Ref2VA checkpoint
 layout (NOT the diffusers conversion). First valid video 2026-08-03
@@ -3403,7 +3403,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   INT8 Fast; Sage stays switchable with its experimental label.
 - **2026-08-20 CK INT8 exact-SM GPU-tuned path:** `ops/comfy_kitchen_attention.mojo`
   owns a reusable H3 scratch allocation and calls the three raw CUDA launchers
-  through `ops/cshim/comfy_kitchen_attention.cpp` on the active MAX stream.
+  through `ops/cshim/comfy_kitchen_attention.cpp` on the active Mojo device stream.
   `scripts/build_h3_ck_attention.sh` pins Comfy Kitchen v0.2.31 commit
   `7c6ca3a5b63857d42c2d49777d6afb69de23f13f` (Apache-2.0) and builds only
   Q/K quantization, V quantization, and Sage attention for one explicit CUDA
@@ -4079,7 +4079,7 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   768x768x124 (the A/B only covered 512x320x56). The deployed
   `output/bin/minimax_h3_serenity_runtime` is reverted to the pre-staged
   build; rebuild+deploy the staged binary only after the decode path is
-  fixed. Separately, the fresh video decode needs a capped MAX arena
+  fixed. Separately, the fresh video decode needs a capped Mojo GPU allocator arena
   (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=55`) at 768x768 or it
   OOMs even on a clean card when the warm --serve worker is resident.
 
@@ -4122,6 +4122,48 @@ client/server contract:
   (`image_path`); true multi-image character_sheet/reference_director needs the
   captioner extended to multiple `<|vision_start|>` blocks. Audio/video
   references reach the Director as text context only.
+
+## 2026-08-30: MINIMAX H3 SERENITYFLOW ENDLESS — MOJO INFERENCE
+
+This is an inference-only continuation vertical. It does not invoke or modify
+the trainer workflow. There are two related but separate product surfaces:
+
+- **H3 Studio Endless** runs in the browser and submits serial `/v1/video`
+  jobs through the existing server control plane. Its state schema is
+  `serenity.h3.endless.v1`; it snapshots the shot contract, creates an exact
+  frame plan, stops only after the active chunk, records completed takes, and
+  can resume from browser `localStorage` or imported project JSON.
+- **The standalone SerenityFlow runner** is a Mojo CLI. It parses the supported
+  SerenityFlow node subset and calls the existing H3 runtime directly; it is
+  not currently wired into the browser server or generic workflow adapter.
+
+The standalone implementation surfaces are:
+
+- `models/minimax_h3/endless.mojo`: 24 fps planning, MiniMax-H3 `17k + 5`
+  internal-frame alignment, phase-exact 40 Hz audio accounting, 5–3600 second
+  requests, bounded 5–15 second chunks, and distinct reference-context versus
+  protected-boundary regions.
+- `pipeline/minimax_h3_endless.mojo`: graph parsing, serial chunk execution,
+  deterministic `seed + chunk_index` seeds, plan fingerprints, atomic
+  checkpoint/resume, fresh per-chunk decode, and exact final assembly.
+- `pipeline/minimax_h3_t2va.mojo`: `--endless-boundary-frames` and
+  `--endless-boundary-audio-latents`; clean timesteps are built first, protected
+  video/audio regions are composited on every denoise call, the clean boundary
+  is restored before export, and overlap frames are trimmed at decode.
+- `configs/minimax_h3_endless_story.json` and
+  `scripts/build_minimax_h3_endless.sh`: the checked-in workflow preset and
+  standalone builder. `models/minimax_h3/parity/minimax_h3_endless_plan_probe.mojo`
+  is the deterministic planner/accounting probe.
+
+Accepted local evidence is deliberately narrow: one real protected-boundary
+leg passed with BF16 + cuDNN at 512x320, 124 internal frames, 119 output frames,
+22 reference frames, 5 protected boundary frames, 9 boundary audio ticks, and
+all 50 transformer blocks finite. The artifact was
+`/tmp/h3-endless-boundary-real/video.mp4`: 119 H.264 frames at 24 fps, stereo
+AAC at 32 kHz, duration 4.958333 seconds. This proves one boundary-conditioned
+leg, not full multi-chunk visual/audio acceptance. Remaining gates are a full
+multi-chunk generation/resume run, seam-level visual identity/motion/audio
+inspection, sampler-trajectory parity, and measured end-to-end speed/peak VRAM.
 
 ## 2026-08-22: SERENITY GENERATE UI + SHARED RESOLUTION LADDER
 

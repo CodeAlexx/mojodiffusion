@@ -186,7 +186,16 @@ function setupTopbarWS() {
             label.textContent = 'Idle';
         }
     }
+    if (!SerenityWS.isConnected()) {
+        dot.className = 'queue-dot';
+        dot.style.background = 'var(--shell-error)';
+        label.textContent = 'Connecting';
+    }
+    else {
+        renderActivity();
+    }
     SerenityWS.on('connected', function () {
+        dot.style.background = '';
         renderActivity();
     });
     SerenityWS.on('disconnected', function () {

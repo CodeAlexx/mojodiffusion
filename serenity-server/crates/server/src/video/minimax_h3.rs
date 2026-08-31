@@ -184,6 +184,17 @@ pub(super) const MINIMAX_H3_REF2VA_RESIDENT_SEQUENCE_LIMIT: i64 = 9_200;
 // final cap from its exact prompt-token count.
 pub(super) const MINIMAX_H3_FAST_RESIDENT_LONG_SEQUENCE_LIMIT: i64 = 37_951;
 pub(super) const MINIMAX_H3_FAST_RESIDENT_LONG_SEQUENCE_BLOCKS: i64 = 8;
+// The resident-block product gates were measured on a 24-GiB card.  A 16-GiB
+// card can still execute the same Mojo graph through the already-supported
+// streamed tail, but promoting even eight blocks leaves too little room for
+// attention and the CUDA allocator when another desktop process owns VRAM.
+// Keep this a control-plane selection only: the model, kernels, and output
+// contract are unchanged.
+pub(super) const MINIMAX_H3_LOW_VRAM_TOTAL_MIB: u64 = 18 * 1024;
+// The streamed denoiser fits below this, but the fresh-process video VAE has a
+// measured ~12.9-GiB peak. Admit the complete A/V pipeline, not just denoise.
+pub(super) const MINIMAX_H3_LOW_VRAM_MIN_FREE_MIB: u64 = 13_500;
+pub(super) const MINIMAX_H3_LOW_VRAM_ALLOCATOR_PERCENT: &str = "55";
 pub(super) const MINIMAX_H3_REF2VA_MAX_IMAGES: usize = 9;
 pub(super) const MINIMAX_H3_REF2VA_MAX_VIDEOS: usize = 3;
 pub(super) const MINIMAX_H3_REF2VA_MAX_AUDIOS: usize = 3;
@@ -486,6 +497,71 @@ pub(super) fn minimax_h3_runtime_resident_blocks(
         "int8" => 41,
         _ => 0,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MiniMaxH3GpuMemory {
+    pub(super) free_mib: u64,
+    pub(super) total_mib: u64,
+}
+
+pub(super) fn minimax_h3_gpu_memory_from_csv(csv: &str) -> Option<MiniMaxH3GpuMemory> {
+    let line = csv.lines().find(|line| !line.trim().is_empty())?;
+    let (free, total) = line.split_once(',')?;
+    let free_mib = free.trim().parse::<u64>().ok()?;
+    let total_mib = total.trim().parse::<u64>().ok()?;
+    (free_mib > 0 && total_mib >= free_mib).then_some(MiniMaxH3GpuMemory {
+        free_mib,
+        total_mib,
+    })
+}
+
+fn minimax_h3_gpu_memory() -> Option<MiniMaxH3GpuMemory> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.free,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    minimax_h3_gpu_memory_from_csv(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub(super) fn minimax_h3_low_vram_mode(memory: Option<&MiniMaxH3GpuMemory>) -> bool {
+    memory.is_some_and(|memory| memory.total_mib <= MINIMAX_H3_LOW_VRAM_TOTAL_MIB)
+}
+
+pub(super) fn minimax_h3_runtime_resident_blocks_for_memory(
+    geometry: &MiniMaxH3RuntimeGeometry,
+    quant: &str,
+    memory: Option<&MiniMaxH3GpuMemory>,
+) -> i64 {
+    if minimax_h3_low_vram_mode(memory) {
+        0
+    } else {
+        minimax_h3_runtime_resident_blocks(geometry, quant)
+    }
+}
+
+pub(super) fn minimax_h3_low_vram_admission(
+    memory: Option<&MiniMaxH3GpuMemory>,
+) -> Result<(), String> {
+    let Some(memory) = memory else {
+        return Ok(());
+    };
+    if !minimax_h3_low_vram_mode(Some(memory)) {
+        return Ok(());
+    }
+    if memory.free_mib >= MINIMAX_H3_LOW_VRAM_MIN_FREE_MIB {
+        return Ok(());
+    }
+    Err(format!(
+        "MiniMax-H3 needs at least {} MiB free on this {} MiB GPU for its streamed low-VRAM path, but only {} MiB is free. Finish or close another GPU workload and retry; Serenity Studio is still running and no model was unloaded outside this app",
+        MINIMAX_H3_LOW_VRAM_MIN_FREE_MIB, memory.total_mib, memory.free_mib,
+    ))
 }
 
 pub(super) fn minimax_h3_ref2va_resident_blocks(
@@ -1272,6 +1348,14 @@ pub(super) fn minimax_h3_capped_command(runner: &std::path::Path) -> std::proces
         .env("MEM_HIGH", "10G")
         .env("SWAP_MAX", "2G")
         .arg(runner);
+    if minimax_h3_low_vram_mode(minimax_h3_gpu_memory().as_ref()) {
+        command
+            .env(
+                "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT",
+                MINIMAX_H3_LOW_VRAM_ALLOCATOR_PERCENT,
+            )
+            .env("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT", "100");
+    }
     command
 }
 
@@ -1700,7 +1784,12 @@ pub(super) fn start_minimax_h3_request(
         .unwrap_or(MINIMAX_H3_STEPS);
     let seed = body.get("seed").and_then(Value::as_u64).unwrap_or(0);
     let runner = MINIMAX_H3_REQUEST_RUNNER.to_string();
-    let resident_blocks = minimax_h3_runtime_resident_blocks(&geometry, &quant);
+    let gpu_memory = minimax_h3_gpu_memory();
+    if let Err(error) = minimax_h3_low_vram_admission(gpu_memory.as_ref()) {
+        return err_detail(StatusCode::CONFLICT, &error);
+    }
+    let resident_blocks =
+        minimax_h3_runtime_resident_blocks_for_memory(&geometry, &quant, gpu_memory.as_ref());
     let n = st
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1732,6 +1821,22 @@ pub(super) fn start_minimax_h3_request(
             "sequence_tokens".to_string(),
             json!(geometry.sequence_tokens),
         );
+        object.insert(
+            "runtime_memory_mode".to_string(),
+            json!(if minimax_h3_low_vram_mode(gpu_memory.as_ref()) {
+                "streamed_low_vram"
+            } else {
+                "product_resident"
+            }),
+        );
+        object.insert("resident_blocks".to_string(), json!(resident_blocks));
+        if let Some(memory) = gpu_memory {
+            object.insert(
+                "gpu_free_mib_at_admission".to_string(),
+                json!(memory.free_mib),
+            );
+            object.insert("gpu_total_mib".to_string(), json!(memory.total_mib));
+        }
     }
     let request_bytes = match serde_json::to_vec_pretty(&request) {
         Ok(bytes) => bytes,
@@ -2291,7 +2396,13 @@ pub(super) fn start_minimax_h3_conditioned_request(
     };
     let runner = minimax_h3_conditioned_runner(runner_task, &quant)
         .expect("validated conditioned MiniMax-H3 request must resolve a runner");
-    let resident_blocks = if task == "ref2va" || combined_continuation {
+    let gpu_memory = minimax_h3_gpu_memory();
+    if let Err(error) = minimax_h3_low_vram_admission(gpu_memory.as_ref()) {
+        return err_detail(StatusCode::CONFLICT, &error);
+    }
+    let resident_blocks = if minimax_h3_low_vram_mode(gpu_memory.as_ref()) {
+        0
+    } else if task == "ref2va" || combined_continuation {
         minimax_h3_ref2va_resident_blocks(&geometry, &quant)
     } else {
         0
@@ -2411,8 +2522,23 @@ pub(super) fn start_minimax_h3_conditioned_request(
             "sequence_tokens".to_string(),
             json!(geometry.sequence_tokens),
         );
+        object.insert(
+            "runtime_memory_mode".to_string(),
+            json!(if minimax_h3_low_vram_mode(gpu_memory.as_ref()) {
+                "streamed_low_vram"
+            } else {
+                "product_resident"
+            }),
+        );
+        object.insert("resident_blocks".to_string(), json!(resident_blocks));
+        if let Some(memory) = gpu_memory {
+            object.insert(
+                "gpu_free_mib_at_admission".to_string(),
+                json!(memory.free_mib),
+            );
+            object.insert("gpu_total_mib".to_string(), json!(memory.total_mib));
+        }
         if task == "ref2va" || combined_continuation {
-            object.insert("resident_blocks".to_string(), json!(resident_blocks));
             object.insert(
                 "memory_policy".to_string(),
                 json!("sequence_adaptive_w8a8_streaming"),

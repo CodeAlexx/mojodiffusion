@@ -15,6 +15,7 @@ var QueueTab = (function () {
     };
     var els = {};
     var elapsedTimer = null;
+    var reconcileInFlight = false;
     function buildUI() {
         var panel = document.getElementById('panel-queue');
         if (!panel)
@@ -82,6 +83,7 @@ var QueueTab = (function () {
         }
     }
     function connectWS() {
+        SerenityWS.on('connected', reconcileServerState);
         SerenityWS.on('execution_start', function (data) {
             var id = data && data.prompt_id ? data.prompt_id : null;
             // Find matching pending entry
@@ -131,46 +133,153 @@ var QueueTab = (function () {
                 state.current.filename = file.filename;
             }
         });
-        SerenityWS.on('execution_success', function () {
-            if (!state.current)
-                return;
-            stopElapsedTimer();
-            state.history.unshift({
-                promptId: state.current.promptId,
-                prompt: state.current.prompt,
-                model: state.current.model,
-                batchLabel: state.current.batchLabel,
-                promptData: state.current.promptData || null,
-                status: 'success',
-                completedAt: Date.now(),
-                filename: state.current.filename,
-                src: state.current.src
-            });
-            if (state.history.length > MAX_HISTORY)
-                state.history.pop();
-            state.current = null;
-            saveHistory();
-            render();
+        SerenityWS.on('execution_success', function (data) {
+            var entry = takeTrackedEntry(data);
+            if (entry)
+                addHistoryEntry(entry, 'success', '');
+            reconcileServerState();
         });
         SerenityWS.on('execution_error', function (data) {
-            if (!state.current)
-                return;
-            stopElapsedTimer();
-            state.history.unshift({
-                promptId: state.current.promptId,
-                prompt: state.current.prompt,
-                model: state.current.model,
-                batchLabel: state.current.batchLabel,
-                promptData: state.current.promptData || null,
-                status: 'error',
-                error: (data && data.exception_message) || 'Unknown error',
-                completedAt: Date.now()
-            });
-            if (state.history.length > MAX_HISTORY)
-                state.history.pop();
+            var entry = takeTrackedEntry(data);
+            if (entry)
+                addHistoryEntry(entry, 'error',
+                    (data && data.exception_message) || 'Unknown error');
+            reconcileServerState();
+        });
+        SerenityWS.on('execution_interrupted', function (data) {
+            var entry = takeTrackedEntry(data);
+            if (entry)
+                addHistoryEntry(entry, 'error', 'Interrupted');
+            reconcileServerState();
+        });
+    }
+    function takeTrackedEntry(data) {
+        var id = String(data && data.prompt_id || '');
+        if (state.current && (!id || String(state.current.promptId) === id)) {
+            var current = state.current;
             state.current = null;
-            saveHistory();
+            stopElapsedTimer();
+            return current;
+        }
+        if (!id)
+            return null;
+        var index = state.pending.findIndex(function (entry) {
+            return String(entry.promptId) === id;
+        });
+        return index >= 0 ? state.pending.splice(index, 1)[0] : null;
+    }
+    function addHistoryEntry(entry, status, error) {
+        if (!entry)
+            return;
+        var id = String(entry.promptId || '');
+        state.history = state.history.filter(function (item) {
+            return String(item.promptId || '') !== id;
+        });
+        state.history.unshift({
+            promptId: entry.promptId,
+            prompt: entry.prompt || '',
+            model: entry.model || '',
+            batchLabel: entry.batchLabel || '',
+            promptData: entry.promptData || null,
+            status: status,
+            error: error || '',
+            completedAt: Date.now(),
+            filename: entry.filename,
+            src: entry.src
+        });
+        if (state.history.length > MAX_HISTORY)
+            state.history.length = MAX_HISTORY;
+        saveHistory();
+        render();
+    }
+    function terminalServerState(value) {
+        return value === 'done' || value === 'failed' || value === 'error' ||
+            value === 'interrupted' || value === 'cancelled' || value === 'canceled';
+    }
+    function applyServerResult(entry, job) {
+        var relative = job && job.output_location && job.output_location.relative_path
+            ? String(job.output_location.relative_path) : '';
+        if (relative) {
+            var parts = relative.split('/');
+            entry.filename = parts.pop();
+            entry.src = SerenityAPI.viewUrl(entry.filename, parts.join('/'), 'output');
+        }
+        if (!entry.prompt && job && job.params)
+            entry.prompt = String(job.params.prompt || '');
+        if (!entry.model && job)
+            entry.model = String(job.model || '');
+        if (!entry.promptData && job && job.params)
+            entry.promptData = { params: job.params };
+        return entry;
+    }
+    function reconcileServerState() {
+        if (reconcileInFlight)
+            return;
+        reconcileInFlight = true;
+        fetch('/v1/jobs', { cache: 'no-store' })
+            .then(function (response) {
+            if (!response.ok)
+                throw new Error('HTTP ' + response.status);
+            return response.json();
+        })
+            .then(function (jobs) {
+            var byId = {};
+            (Array.isArray(jobs) ? jobs : []).forEach(function (job) {
+                if (job && job.id)
+                    byId[String(job.id)] = job;
+            });
+            state.pending.slice().forEach(function (entry) {
+                var job = byId[String(entry.promptId || '')];
+                if (!job || !terminalServerState(String(job.state || '')))
+                    return;
+                state.pending = state.pending.filter(function (candidate) {
+                    return candidate !== entry;
+                });
+                applyServerResult(entry, job);
+                addHistoryEntry(entry,
+                    String(job.state) === 'done' ? 'success' : 'error',
+                    String(job.error || job.state || 'Generation failed'));
+            });
+            if (state.current) {
+                var currentJob = byId[String(state.current.promptId || '')];
+                if (currentJob && terminalServerState(String(currentJob.state || ''))) {
+                    var current = state.current;
+                    state.current = null;
+                    stopElapsedTimer();
+                    applyServerResult(current, currentJob);
+                    addHistoryEntry(current,
+                        String(currentJob.state) === 'done' ? 'success' : 'error',
+                        String(currentJob.error || currentJob.state || 'Generation failed'));
+                }
+            }
+            if (!state.current) {
+                var running = state.pending.find(function (entry) {
+                    var job = byId[String(entry.promptId || '')];
+                    return job && String(job.state) === 'running';
+                });
+                if (running) {
+                    state.pending = state.pending.filter(function (entry) {
+                        return entry !== running;
+                    });
+                    var runningJob = byId[String(running.promptId || '')];
+                    state.current = Object.assign({}, running, {
+                        startedAt: Date.now(),
+                        step: Number(runningJob.step) || 0,
+                        maxStep: Number(runningJob.total) || 0,
+                        node: null,
+                        src: null,
+                        filename: null
+                    });
+                    startElapsedTimer();
+                }
+            }
             render();
+        })
+            .catch(function (error) {
+            console.warn('[QueueTab] Server reconciliation failed:', error.message);
+        })
+            .finally(function () {
+            reconcileInFlight = false;
         });
     }
     function startElapsedTimer() {
@@ -473,6 +582,7 @@ var QueueTab = (function () {
         }
         state.pending.push(entry);
         render();
+        setTimeout(reconcileServerState, 0);
     }
     function init() {
         if (initialized)
@@ -484,10 +594,12 @@ var QueueTab = (function () {
         connectWS();
         renderPauseBtn();
         render();
+        reconcileServerState();
     }
     return {
         init: init,
         registerPending: registerPending,
+        reconcile: reconcileServerState,
         state: state
     };
 })();

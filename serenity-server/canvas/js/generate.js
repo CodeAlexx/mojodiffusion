@@ -136,6 +136,7 @@ var GenerateTab = (function () {
         mediaUploadsInFlight: 0
     };
     var initialized = false;
+    var errorTimer = null;
     // Image samplers are not constrained by the bounded LTX request profile.
     // LTX temporarily rewrites these shared controls to its exact 8/20-step
     // schedules, so every switch back to an image model must restore them.
@@ -4890,6 +4891,8 @@ var GenerateTab = (function () {
             renderExternalActivity();
     }
     function setGenerating(v) {
+        if (v)
+            clearError();
         state.generating = v;
         var isVideo = ModelUtils.isVideoModel(state.model);
         els.btn.disabled = v;
@@ -5642,15 +5645,32 @@ var GenerateTab = (function () {
         updateTokenCount();
     }
     // ── Error Display ──
+    function clearError() {
+        if (errorTimer) {
+            clearTimeout(errorTimer);
+            errorTimer = null;
+        }
+        if (!els.errorBanner)
+            return;
+        els.errorBanner.classList.remove('visible');
+        els.errorBanner.textContent = '';
+    }
     function showError(msg) {
+        if (errorTimer)
+            clearTimeout(errorTimer);
         els.errorBanner.textContent = msg;
         els.errorBanner.classList.add('visible');
-        setTimeout(function () {
+        errorTimer = setTimeout(function () {
             els.errorBanner.classList.remove('visible');
+            els.errorBanner.textContent = '';
+            errorTimer = null;
         }, 5000);
     }
     // ── WebSocket (via shared SerenityWS) ──
     function connectWS() {
+        // The shared socket may already be open before this tab initializes.
+        // Render its current state instead of waiting for another transition.
+        els.wsIndicator.classList.toggle('visible', !SerenityWS.isConnected());
         SerenityWS.on('connected', function () {
             els.wsIndicator.classList.remove('visible');
         });

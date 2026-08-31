@@ -29,6 +29,11 @@ compatibility unless a separately reviewed contract migration changes them.
   silently change explicit request values.
 - Failures remain visible and actionable. A missing server artifact is reported
   as missing; the browser must not require an external assistant to create it.
+- Connection labels reflect the shared WebSocket's current state even when a
+  tab initializes after the socket opened. Expired Generate errors remove both
+  visibility and stale text. Queue terminal handling is prompt-id scoped and
+  reconciles locally registered work against `/v1/jobs`, so a missed start or
+  completion event cannot leave finished work shown as Pending.
 - User-selected output roots and run identifiers are treated as data from the
   server. The browser does not construct developer-machine filesystem paths.
 - Prompt editors expose a practical multiline viewport and remain vertically
@@ -172,6 +177,12 @@ compatibility unless a separately reviewed contract migration changes them.
 - Native continuation accepts only a completed local `video-NNNN` at the same
   resolution. It reuses native video/audio motion context, accepts 5/22/39-frame
   windows, and trims the selected overlap from delivery.
+- On GPUs with 18 GiB or less, H3 uses its existing streamed runtime with zero
+  resident blocks and the bounded Mojo allocator. The server checks live free
+  VRAM after reaping only its own idle image worker, records the selected memory
+  mode in the request artifact, and fails before CUDA initialization when the
+  streamed path lacks headroom. It never resolves pressure by stopping another
+  Serenity stack or external GPU process.
 - The Endless controller is inference-only and serial. It plans exact 24-FPS
   output segments between 120 and 360 frames, persists schema
   `serenity.h3.endless.v1`, increments the seed by segment index, carries

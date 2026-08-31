@@ -288,6 +288,38 @@ fn minimax_h3_request_is_runtime_adjustable_and_switchable() {
         minimax_h3_runtime_resident_blocks(&resident_geometry, "int8"),
         0,
     );
+    let low_vram = MiniMaxH3GpuMemory {
+        free_mib: 10_748,
+        total_mib: 16_303,
+    };
+    assert!(minimax_h3_low_vram_mode(Some(&low_vram)));
+    assert_eq!(
+        minimax_h3_runtime_resident_blocks_for_memory(
+            &resident_geometry,
+            "int8-fast",
+            Some(&low_vram),
+        ),
+        0,
+    );
+    assert!(minimax_h3_low_vram_admission(Some(&low_vram)).is_err());
+    let low_vram_ready = MiniMaxH3GpuMemory {
+        free_mib: 14_690,
+        total_mib: 16_303,
+    };
+    assert!(minimax_h3_low_vram_admission(Some(&low_vram_ready)).is_ok());
+    let product_vram = MiniMaxH3GpuMemory {
+        free_mib: 22_000,
+        total_mib: 24_000,
+    };
+    assert!(!minimax_h3_low_vram_mode(Some(&product_vram)));
+    assert_eq!(
+        minimax_h3_runtime_resident_blocks_for_memory(
+            &resident_geometry,
+            "int8-fast",
+            Some(&product_vram),
+        ),
+        8,
+    );
     request["duration_seconds"] = json!(7.0);
     request["frames"] = json!(168);
     let streamed_geometry = minimax_h3_runtime_geometry(&request).unwrap();
@@ -800,6 +832,26 @@ fn minimax_h3_ck_attention_selects_the_exact_visible_gpu_sm() {
         minimax_h3_ck_dso_path_for_sm(89),
         repo_path("output/lib/ck/sm89/libserenity_ck_attention.so")
     );
+}
+
+#[test]
+fn minimax_h3_gpu_memory_parser_is_strict_and_nounits_compatible() {
+    assert_eq!(
+        minimax_h3_gpu_memory_from_csv("10748, 16303\n"),
+        Some(MiniMaxH3GpuMemory {
+            free_mib: 10_748,
+            total_mib: 16_303,
+        })
+    );
+    assert_eq!(
+        minimax_h3_gpu_memory_from_csv("\n22000, 24564\n18000, 24564\n"),
+        Some(MiniMaxH3GpuMemory {
+            free_mib: 22_000,
+            total_mib: 24_564,
+        })
+    );
+    assert!(minimax_h3_gpu_memory_from_csv("N/A, 16303").is_none());
+    assert!(minimax_h3_gpu_memory_from_csv("17000, 16303").is_none());
 }
 
 #[test]

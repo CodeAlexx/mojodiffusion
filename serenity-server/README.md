@@ -40,6 +40,26 @@ and INT8 resident caches do not hide or disable the model. BF16 starts directly;
 the first INT8 or INT8 Fast request builds its selected acceleration cache in a
 separate GPU-only phase, then reuses that cache on later requests.
 
+On GPUs with 18 GiB or less, the H3 control plane selects the existing fully
+streamed Mojo tail (`resident_blocks=0`) and caps the Mojo device allocator to
+55 percent. This is the 16-GiB/RTX 5080 reliability profile; it changes
+residency and speed, not model weights, kernels, conditioning, or output
+semantics. Admission records `runtime_memory_mode`, resident blocks, and the
+observed free/total VRAM in `request.json`. If fewer than 13,500 MiB are free
+after Serenity Studio has reaped its own idle image worker, the request is
+rejected before CUDA initialization with an actionable GPU-headroom message.
+That floor covers the complete fresh-process video VAE decode peak, not merely
+the lower-memory streamed denoiser.
+The server does not kill or unload processes belonging to SerenityFlow,
+Trainer, or another application.
+
+Browser connection, error, and queue indicators are job-scoped. A Generate tab
+opened after the shared WebSocket connected must immediately show the live
+state; expired errors clear their text; and Queue reconciles locally registered
+jobs with `/v1/jobs` on initialization, reconnection, and terminal events. A
+missed `execution_start` event therefore cannot leave a completed request
+permanently marked Pending.
+
 ## H3 Studio, continuation, and Endless
 
 H3 Studio is available at `/?tab=h3-studio`. It persists
@@ -239,6 +259,13 @@ curl -fsS http://127.0.0.1:7801/v1/health
 curl -fsS http://127.0.0.1:7801/v1/capabilities
 curl -fsS http://127.0.0.1:7801/
 curl -fsS http://127.0.0.1:7801/video_edit/status
+```
+
+After a browser-state or worker-switch repair, run the focused recovery gate:
+
+```bash
+SERENITY_BASE_URL=http://127.0.0.1:7801 \
+  node scripts/check_serenity_runtime_recovery.js
 ```
 
 If port 7801 is occupied, inspect its owner. Do not kill it or silently select

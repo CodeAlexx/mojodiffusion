@@ -12,7 +12,10 @@ from max.gpu.host import DeviceContext, HostBuffer, DeviceEvent
 from std.memory import alloc, ArcPointer
 
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.io.ffi import BytePtr, sys_memcpy
+from serenitymojo.io.ffi import (
+    BytePtr, O_RDONLY, POSIX_FADV_DONTNEED, sys_close, sys_memcpy, sys_open,
+    sys_posix_fadvise, sys_pread,
+)
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors_writer import (
@@ -38,6 +41,7 @@ from serenitymojo.models.dit.minimax_h3_fp8_resident import (
     MINIMAX_H3_RESIDENT_INT8,
     MINIMAX_H3_RESIDENT_INT8_W8A8,
     MiniMaxH3BlockResidentFp8,
+    MiniMaxH3HostRamCache,
     MiniMaxH3ResidentFp8,
     minimax_h3_allocate_resident_scratch,
     minimax_h3_int8_group_size,
@@ -47,6 +51,127 @@ from serenitymojo.models.dit.minimax_h3_modcache import MiniMaxH3ModCache
 
 
 comptime MINIMAX_H3_RUNTIME_CACHE_VERSION = 1
+comptime _HOST_RAM_CACHE_SAFETY_BYTES = 8 * 1024 * 1024 * 1024
+comptime _HOST_RAM_COPY_CHUNK_BYTES = 256 * 1024 * 1024
+
+
+def _host_mem_available_bytes() -> Int:
+    """Read Linux MemAvailable from /proc without a shell or Python helper."""
+    var fd = sys_open(String("/proc/meminfo"), O_RDONLY)
+    if fd < 0:
+        return -1
+    var cap = 64 * 1024
+    var buf = alloc[UInt8](cap)
+    var got = sys_pread(
+        fd, BytePtr(unsafe_from_address=Int(buf)), cap, 0
+    )
+    _ = sys_close(fd)
+    if got <= 0:
+        buf.free()
+        return -1
+    var needle = String("MemAvailable:").as_bytes()
+    var value_kib = -1
+    for i in range(Int(got) - len(needle) + 1):
+        var matched = True
+        for j in range(len(needle)):
+            if buf[i + j] != needle[j]:
+                matched = False
+                break
+        if not matched:
+            continue
+        var p = i + len(needle)
+        while p < Int(got) and (buf[p] < UInt8(48) or buf[p] > UInt8(57)):
+            p += 1
+        var parsed = 0
+        var digits = 0
+        while p < Int(got) and buf[p] >= UInt8(48) and buf[p] <= UInt8(57):
+            parsed = parsed * 10 + Int(buf[p] - UInt8(48))
+            digits += 1
+            p += 1
+        if digits > 0:
+            value_kib = parsed
+        break
+    buf.free()
+    return value_kib * 1024 if value_kib >= 0 else -1
+
+
+def prepare_minimax_h3_w8a8_host_ram_cache(
+    mut resident: MiniMaxH3ResidentFp8,
+    cache_path: String,
+    source_index: String,
+) raises:
+    """Materialize the full W8A8 cache in owned anonymous RAM before denoise.
+
+    This is a correctness boundary, not an optional readahead hint.  Linux
+    page cache may be reclaimed; anonymous memory remains the tail source for
+    this request.  Source pages are released after each bounded copy chunk, so
+    fail closed unless MemAvailable covers the payload plus an 8 GiB
+    desktop/runtime reserve.
+    """
+    if resident.scheme != MINIMAX_H3_RESIDENT_INT8_W8A8:
+        raise Error("MiniMax-H3 host-RAM tail requires W8A8 storage")
+    if len(resident.tail_ram) != 0:
+        return
+    var st = SafeTensors.open(cache_path)
+    _check_common_metadata(
+        st, String("resident-int8-w8a8-row"), source_index
+    )
+    var cached_start = _meta_i64(st, String("__meta__.start_layer"), -1)
+    var cached_blocks = _meta_i64(st, String("__meta__.nblocks"), -1)
+    if cached_start != 0 or cached_blocks < 50:
+        raise Error("MiniMax-H3 host-RAM cache must cover all 50 blocks")
+    var nbytes = st.region.len()
+    var available = _host_mem_available_bytes()
+    var required = nbytes + _HOST_RAM_CACHE_SAFETY_BYTES
+    if available < 0:
+        raise Error(
+            "MiniMax-H3 cannot prove host-RAM capacity; refusing disk "
+            "streaming because /proc/meminfo is unavailable"
+        )
+    if available < required:
+        raise Error(
+            String("MiniMax-H3 no-disk mode needs ")
+            + String(required // (1024 * 1024))
+            + String(" MiB MemAvailable during preload, but found ")
+            + String(available // (1024 * 1024)) + String(" MiB")
+        )
+    print(
+        "  host-RAM cache: preloading ",
+        Float64(nbytes) / (1024.0 * 1024.0 * 1024.0),
+        " GiB once before denoise (no per-step disk reads)",
+    )
+    var ram = MiniMaxH3HostRamCache(nbytes)
+    var source_fd = sys_open(cache_path, O_RDONLY)
+    if source_fd < 0:
+        raise Error("MiniMax-H3 cannot open W8A8 cache for bounded preload")
+    var copied = 0
+    while copied < nbytes:
+        var chunk = min(_HOST_RAM_COPY_CHUNK_BYTES, nbytes - copied)
+        var src = st.region.as_ptr() + copied
+        _ = sys_memcpy(ram.ptr() + copied, src, chunk)
+        if (
+            ram.ptr()[copied] != src[0]
+            or ram.ptr()[copied + chunk - 1] != src[chunk - 1]
+        ):
+            _ = sys_close(source_fd)
+            raise Error("MiniMax-H3 host-RAM cache chunk verification failed")
+        st.region.release_range(copied, chunk)
+        _ = sys_posix_fadvise(
+            source_fd,
+            st.region.source_offset(copied),
+            chunk,
+            POSIX_FADV_DONTNEED,
+        )
+        copied += chunk
+    _ = sys_close(source_fd)
+    # Drop any remaining file-backed PTEs now.  The parsed tensor index remains
+    # in `st`, while every payload byte used below comes from `ram`.
+    st.region.release_to_os()
+    resident.tail_st = List[ArcPointer[SafeTensors]]()
+    resident.tail_st.append(ArcPointer(st^))
+    resident.tail_st_path = cache_path.copy()
+    resident.tail_ram.append(ArcPointer(ram^))
+    print("  host-RAM cache: READY; file-backed payload released")
 
 
 def _stat_size_mtime(path: String) -> List[Int]:
@@ -238,6 +363,7 @@ def _tail_stage_ensure(
 
 def _tail_stage_copy(
     st: SafeTensors,
+    ram_arc: ArcPointer[MiniMaxH3HostRamCache],
     name: String,
     mut dst: Tensor,
     slab_arc: ArcPointer[HostBuffer[DType.uint8]],
@@ -267,7 +393,13 @@ def _tail_stage_copy(
     var host_dst = BytePtr(
         unsafe_from_address=Int(slab.unsafe_ptr()) + half_base + offset
     )
-    var src = BytePtr(unsafe_from_address=Int(view.data.unsafe_ptr()))
+    var mmap_src = BytePtr(unsafe_from_address=Int(view.data.unsafe_ptr()))
+    var region_base = st.region.as_ptr()
+    var region_offset = Int(mmap_src) - Int(region_base)
+    ref ram = ram_arc[]
+    if region_offset < 0 or region_offset + nbytes > ram.nbytes:
+        raise Error("MiniMax-H3 host-RAM tensor offset outside cache")
+    var src = ram.ptr() + region_offset
     _ = sys_memcpy(host_dst, src, nbytes)
     var host_view = slab.create_sub_buffer[DType.uint8](
         half_base + offset, nbytes
@@ -465,9 +597,11 @@ def reload_minimax_h3_resident_w8a8_block(
     re-parses the 54 KB header and re-mmaps the 19.8 GB cache PER CALL,
     which the streamed tail previously paid up to 1440x per job."""
     if len(resident.tail_st) == 0 or resident.tail_st_path != cache_path:
-        resident.tail_st = List[ArcPointer[SafeTensors]]()
-        resident.tail_st.append(ArcPointer(SafeTensors.open(cache_path)))
-        resident.tail_st_path = cache_path.copy()
+        prepare_minimax_h3_w8a8_host_ram_cache(
+            resident, cache_path, source_index
+        )
+    if len(resident.tail_ram) != 1:
+        raise Error("MiniMax-H3 W8A8 tail is not resident in host RAM")
     var st_arc = resident.tail_st[0]
     reload_minimax_h3_resident_w8a8_block_st(
         resident, st_arc[], source_index, config, layer, ctx
@@ -495,10 +629,10 @@ def reload_minimax_h3_resident_w8a8_block_st(
         raise Error("MiniMax-H3 reusable tail requires the W8A8 scheme")
     if len(resident.blocks) != 1:
         raise Error("MiniMax-H3 reusable tail requires exactly one block")
-    _check_common_metadata(st, String("resident-int8-w8a8-row"), source_index)
-    var cached_start = _meta_i64(st, String("__meta__.start_layer"), -1)
-    var cached_blocks = _meta_i64(st, String("__meta__.nblocks"), -1)
-    if layer < cached_start or layer >= cached_start + cached_blocks:
+    # Metadata and the exact full-stack range were validated before the
+    # anonymous-RAM copy.  Do not touch even metadata payload pages in the
+    # per-layer hot loop.
+    if layer < 0 or layer >= 50:
         raise Error("MiniMax-H3 reusable tail layer outside cache range")
 
     # Pinned two-half staging sized to one block (all H3 blocks share shapes).
@@ -541,11 +675,13 @@ def reload_minimax_h3_resident_w8a8_block_st(
             if qslot >= len(block.fp8):
                 raise Error("MiniMax-H3 reusable tail quantized-slot mismatch")
             _tail_stage_copy(
-                st, prefix + String("weight.") + String(qslot),
+                st, resident.tail_ram[0],
+                prefix + String("weight.") + String(qslot),
                 block.fp8[qslot][], slab_arc, half_bytes, half_base, cursor, ctx,
             )
             _tail_stage_copy(
-                st, prefix + String("scale.") + String(qslot),
+                st, resident.tail_ram[0],
+                prefix + String("scale.") + String(qslot),
                 block.scale[qslot][], slab_arc, half_bytes, half_base, cursor, ctx,
             )
             block.fp8_names[qslot] = name.copy()
@@ -554,7 +690,8 @@ def reload_minimax_h3_resident_w8a8_block_st(
             if kslot >= len(block.bf16):
                 raise Error("MiniMax-H3 reusable tail keep-slot mismatch")
             _tail_stage_copy(
-                st, prefix + String("keep.") + String(kslot),
+                st, resident.tail_ram[0],
+                prefix + String("keep.") + String(kslot),
                 block.bf16[kslot][], slab_arc, half_bytes, half_base, cursor, ctx,
             )
             block.bf16_names[kslot] = name.copy()

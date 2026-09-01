@@ -16,14 +16,10 @@ pub(super) const MINIMAX_H3_PRODUCT_GATE: &str = "output/checks/minimax_h3_produ
 pub(super) const MINIMAX_H3_MODEL_ROOT: &str = "checkpoints/MiniMax-H3/FL2VA";
 pub(super) const MINIMAX_H3_ENCODER_CACHE: &str =
     "checkpoints/MiniMax-H3/FL2VA/text_encoder/serenity_int8_rowscale_v1";
-pub(super) const MINIMAX_H3_CONDITIONING_CACHE: &str =
-    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/conditioning_ff21f1ebd1c73098_int8_bf16_output.bin";
-pub(super) const MINIMAX_H3_MODULATION_CACHE: &str =
-    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/modcache_steps_20_blocks_50.safetensors";
-pub(super) const MINIMAX_H3_INT8_RESIDENT_CACHE: &str =
-    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/resident_groupwise_q16_o64_fc132_fc264_blocks_48.safetensors";
-pub(super) const MINIMAX_H3_INT8_FAST_RESIDENT_CACHE: &str =
-    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/resident_w8a8_row_blocks_50.safetensors";
+pub(super) const MINIMAX_H3_CONDITIONING_CACHE: &str = "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/conditioning_ff21f1ebd1c73098_int8_bf16_output.bin";
+pub(super) const MINIMAX_H3_MODULATION_CACHE: &str = "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/modcache_steps_20_blocks_50.safetensors";
+pub(super) const MINIMAX_H3_INT8_RESIDENT_CACHE: &str = "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/resident_groupwise_q16_o64_fc132_fc264_blocks_48.safetensors";
+pub(super) const MINIMAX_H3_INT8_FAST_RESIDENT_CACHE: &str = "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/resident_w8a8_row_blocks_50.safetensors";
 pub(super) const MINIMAX_H3_WIDTH: i64 = 512;
 pub(super) const MINIMAX_H3_HEIGHT: i64 = 320;
 pub(super) const MINIMAX_H3_FRAMES: i64 = 175;
@@ -84,13 +80,11 @@ fn minimax_h3_warm_submit(
         let serve_err = serve_log.try_clone()?;
         let mut cmd = minimax_h3_capped_command(&repo_path(runner));
         cmd.current_dir(repo_root())
-            // Flat memory band (MemoryHigh == MemoryMax): the default 10G
-            // MemoryHigh reclaim band makes pinned host allocations fail
-            // under pressure and surface as CUDA_ERROR_OUT_OF_MEMORY
-            // (MJ-1140 signature; the identical job passes standalone with
-            // the flat band and fails under the server's 10G-high).
-            .env("MEM_MAX", "12G")
-            .env("MEM_HIGH", "12G")
+            // H3's 16-GiB-GPU lane mirrors the 17.96-GiB W8A8 cache into
+            // anonymous host RAM in bounded chunks before denoise. Use the
+            // sanctioned large-runtime band with no MemoryHigh reclaim.
+            .env("MEM_MAX", "24G")
+            .env("MEM_HIGH", "infinity")
             .env("LD_LIBRARY_PATH", minimax_h3_ld_path())
             .env("CUDA_CACHE_PATH", LTX2_CUDA_CACHE)
             .env("CUDA_MODULE_LOADING", "EAGER")
@@ -165,15 +159,11 @@ pub(super) const MINIMAX_H3_CONDITIONED_PROMPT_FILE: &str =
     include_str!("../../../../../serenitymojo/configs/minimax_h3_conditioned_prompt.txt");
 pub(super) const MINIMAX_H3_CONDITIONED_DECODE_RUNNER: &str =
     "output/bin/minimax_h3_decode_768x768x124";
-pub(super) const MINIMAX_H3_CONDITIONED_MODULATION_CACHE: &str =
-    "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/modcache_keyframe_steps_20_blocks_50.safetensors";
+pub(super) const MINIMAX_H3_CONDITIONED_MODULATION_CACHE: &str = "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/modcache_keyframe_steps_20_blocks_50.safetensors";
 pub(super) const MINIMAX_H3_REF2VA_MODEL_ROOT: &str = "checkpoints/MiniMax-H3/Ref2VA";
-pub(super) const MINIMAX_H3_REF2VA_MODULATION_CACHE: &str =
-    "checkpoints/MiniMax-H3/Ref2VA/serenity_runtime_cache_v1/modcache_ref_image_steps_20_blocks_50.safetensors";
-pub(super) const MINIMAX_H3_REF2VA_INT8_RESIDENT_CACHE: &str =
-    "checkpoints/MiniMax-H3/Ref2VA/serenity_runtime_cache_v1/resident_groupwise_q16_o64_fc132_fc264_blocks_48.safetensors";
-pub(super) const MINIMAX_H3_REF2VA_INT8_FAST_RESIDENT_CACHE: &str =
-    "checkpoints/MiniMax-H3/Ref2VA/serenity_runtime_cache_v1/resident_w8a8_row_blocks_50.safetensors";
+pub(super) const MINIMAX_H3_REF2VA_MODULATION_CACHE: &str = "checkpoints/MiniMax-H3/Ref2VA/serenity_runtime_cache_v1/modcache_ref_image_steps_20_blocks_50.safetensors";
+pub(super) const MINIMAX_H3_REF2VA_INT8_RESIDENT_CACHE: &str = "checkpoints/MiniMax-H3/Ref2VA/serenity_runtime_cache_v1/resident_groupwise_q16_o64_fc132_fc264_blocks_48.safetensors";
+pub(super) const MINIMAX_H3_REF2VA_INT8_FAST_RESIDENT_CACHE: &str = "checkpoints/MiniMax-H3/Ref2VA/serenity_runtime_cache_v1/resident_w8a8_row_blocks_50.safetensors";
 pub(super) const MINIMAX_H3_REF2VA_RUNTIME_CACHE_RUNNER: &str =
     "output/bin/minimax_h3_ref2va_runtime_cache";
 pub(super) const MINIMAX_H3_REF2VA_IMAGE_SIDE: u32 = 768;
@@ -1338,14 +1328,14 @@ pub(super) fn minimax_h3_ld_path() -> std::ffi::OsString {
     std::env::join_paths(paths).unwrap_or_default()
 }
 
-/// Keep safetensor page cache from placing the whole desktop in oomd's kill
-/// path. Model kernels still execute on GPU; this cap governs host RSS and
-/// file-backed cache for the runner process tree.
+/// Bound the H3 runner while allowing its no-disk denoise contract: the
+/// 17.96-GiB W8A8 payload is copied once into owned host RAM in bounded chunks.
+/// Model kernels still execute on GPU.
 pub(super) fn minimax_h3_capped_command(runner: &std::path::Path) -> std::process::Command {
-    let mut command = std::process::Command::new(repo_path("scripts/mem_safe.sh"));
+    let mut command = std::process::Command::new(repo_path("scripts/mem_safe_runtime.sh"));
     command
-        .env("MEM_MAX", "12G")
-        .env("MEM_HIGH", "10G")
+        .env("MEM_MAX", "24G")
+        .env("MEM_HIGH", "infinity")
         .env("SWAP_MAX", "2G")
         .arg(runner);
     if minimax_h3_low_vram_mode(minimax_h3_gpu_memory().as_ref()) {
@@ -2156,7 +2146,7 @@ pub(super) fn start_minimax_h3_request(
             .arg(steps.to_string())
             .arg(seed.to_string())
             .arg("50")
-            .arg("decode_only")
+            .arg("decode_video_only")
             .arg(format!("--width={profile_width}"))
             .arg(format!("--height={profile_height}"))
             .arg(format!("--frames={internal_frames}"))
@@ -2906,7 +2896,7 @@ pub(super) fn start_minimax_h3_conditioned_request(
             .arg(steps.to_string())
             .arg(seed.to_string())
             .arg("50")
-            .arg("decode_only")
+            .arg("decode_video_only")
             .arg(format!("--width={}", thread_geometry.width))
             .arg(format!("--height={}", thread_geometry.height))
             .arg(format!("--frames={}", thread_geometry.internal_frames))

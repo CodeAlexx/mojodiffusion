@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 musubi_repo="${MUSUBI_REPO:-$(dirname "$repo")/musubi-tuner}"
-python_bin="${H3_ORACLE_PYTHON:-$(dirname "$repo")/OneTrainer/venv/bin/python}"
+python_bin="${H3_ORACLE_PYTHON:-${H3_TORCH_ORACLE_PYTHON:-python3}}"
 fixture="$repo/serenitymojo/training/parity/fixtures/minimax_h3_video_vae_tiling_v1.json"
 gate="$repo/serenitymojo/training/parity/minimax_h3_video_vae_tiling_parity.mojo"
 binary=/tmp/minimax_h3_video_vae_tiling_parity

@@ -90,8 +90,8 @@ for entry in "${required_source_counts[@]}"; do
 done
 
 map_count=$(find serenity-server/canvas -type f -name '*.map' | wc -l)
-if ((map_count != 35)); then
-  echo "error: expected 35 canvas source maps, found $map_count" >&2
+if ((map_count != 0)); then
+  echo "error: identity canvas source maps are forbidden, found $map_count" >&2
   exit 1
 fi
 
@@ -183,7 +183,7 @@ fi
 
 if ! rg -Fq 'env!("CARGO_MANIFEST_DIR")' \
   serenity-server/crates/server/src/main.rs \
-  || ! rg -Fq '"/../../../output/bin/serenity_worker_stub"' \
+  || ! rg -Fq 'repository_root_path().join("output/bin/serenity_worker_stub")' \
   serenity-server/crates/server/src/main.rs; then
   echo "error: inference worker default is not repository-rooted" >&2
   exit 1

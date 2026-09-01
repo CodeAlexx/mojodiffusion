@@ -629,11 +629,25 @@ Pure-Mojo byte-level BPE for the Qwen3 encoder (replaces the Rust `tokenizers` c
   `ops/cshim/comfy_kitchen_attention.cpp` expose the accepted CK INT8 fast
   backend with one run-lifetime scratch and the active MAX CUDA stream.
   `scripts/build_h3_ck_attention.sh` pins Comfy Kitchen v0.2.31 and builds only
-  the three SM86 attention launchers into a 6.7-MiB Python-free DSO. At the
-  real H3 S=19,029/21,291 shapes it measured cosine 0.999860 versus exact
-  cU-DNN, zero repeat mismatches, and 1.73x/1.69x versus the former Mojo PV8
-  path. Two distinct 1024x576, 20-step decoded product gates passed. CK is the
-  INT8 UI fast default; bare/API omission and BF16 retain exact cU-DNN.
+  the three launchers into an exact-SM Python-free DSO. It discovers the CUDA
+  toolkit dynamically and supports both CUDA 12.4's compatibility shim and
+  newer toolkits' native low-precision definitions. At the real H3
+  S=19,029/21,291 shapes, SM86 measured cosine 0.999860 versus exact cU-DNN,
+  zero repeat mismatches, and 1.73x/1.69x versus the former Mojo PV8 path; two
+  distinct 1024x576, 20-step decoded product gates passed. The SM120/CUDA-13.1
+  attention gate also passed with zero repeat mismatches and 1.92x/1.88x over
+  PV8, but has not yet run a decoded product-video gate. CK is the INT8 UI fast
+  default; bare/API omission and BF16 retain exact cU-DNN.
+- `ops/adaptive_block_attention_{bf16,tiled_bf16,sm120_bf16}.mojo` provides
+  the block-adaptive BF16 research stack. H3 exposes only the measured,
+  compile-time-dark `adaptive-sm120-sol-tau150` build on SM120: CK for early
+  evaluations, exact cU-DNN for the first two late layers, and SOL for the
+  remaining late layers. The real S=90,808 RTX 5080 continuation gate measured
+  7.058% less time across late evaluations than CK, 13,073 MiB peak GPU memory,
+  zero swap, and one-evaluation video/audio cosine of
+  0.99999648/0.99998660. Full-final cosine was 0.98767912/0.98230977, so the
+  backend remains opt-in and approximate; it is not compiled into or selected
+  by the ordinary product runner.
 - `models/minimax_h3_device/audio_encoder_device.mojo` implements the learned
   Ref2VA AudioVAE encoder on GPU after media staging. Its real-weight trunk,
   pre-block, and posterior mean all exceed 0.999999999 cosine.

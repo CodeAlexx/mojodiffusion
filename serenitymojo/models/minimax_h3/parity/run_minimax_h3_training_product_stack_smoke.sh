@@ -10,16 +10,8 @@ fixture_sha="${fixture_dir}/minimax_h3_training_stack50_bf16_flash.sha256"
 oracle="${script_dir}/minimax_h3_training_stack50_bf16_flash_oracle.py"
 gate="${script_dir}/minimax_h3_training_product_stack_smoke.mojo"
 binary="/tmp/minimax_h3_training_product_stack_smoke"
-oracle_python="${H3_TRAIN_ORACLE_PYTHON:-}"
+oracle_python="${H3_TRAIN_ORACLE_PYTHON:-${H3_TORCH_ORACLE_PYTHON:-python3}}"
 target_accelerator="${H3_TARGET_ACCELERATOR:-}"
-
-if [[ -z "${oracle_python}" ]]; then
-    if [[ -x "${repo_root}/../OneTrainer/venv/bin/python" ]]; then
-        oracle_python="${repo_root}/../OneTrainer/venv/bin/python"
-    else
-        oracle_python=python3
-    fi
-fi
 
 if [[ -z "${target_accelerator}" ]]; then
     compute_cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d '.')"

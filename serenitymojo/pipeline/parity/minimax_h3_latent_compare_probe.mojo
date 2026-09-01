@@ -75,23 +75,29 @@ def _compare(
 
 def main() raises:
     var args = argv()
-    if len(args) != 3:
+    if len(args) != 3 and len(args) != 5:
         raise Error(
             "usage: minimax_h3_latent_compare_probe"
             " <reference.safetensors> <candidate.safetensors>"
+            " [video_tensor_name audio_tensor_name]"
         )
+    var video_name = String("video_state_rows")
+    var audio_name = String("audio_state_rows")
+    if len(args) == 5:
+        video_name = String(args[3])
+        audio_name = String(args[4])
     var ctx = DeviceContext()
     var ref_st = SafeTensors.open(String(args[1]))
     var got_st = SafeTensors.open(String(args[2]))
     _compare(
-        "video_state_rows",
-        _load(ref_st, "video_state_rows", ctx),
-        _load(got_st, "video_state_rows", ctx),
+        video_name,
+        _load(ref_st, video_name, ctx),
+        _load(got_st, video_name, ctx),
         ctx,
     )
     _compare(
-        "audio_state_rows",
-        _load(ref_st, "audio_state_rows", ctx),
-        _load(got_st, "audio_state_rows", ctx),
+        audio_name,
+        _load(ref_st, audio_name, ctx),
+        _load(got_st, audio_name, ctx),
         ctx,
     )

@@ -282,13 +282,15 @@ var ModelUtils = (function () {
                 rememberModel(model);
                 return {
                     name: model.name,
+                    displayName: model.card && model.card.title || model.name,
                     path: model.path,
                     arch: normalizeRegistryArch(model.arch),
                     format: model.format || 'diffusion_model',
                     loader: model.format === 'full_checkpoint' ? 'checkpoint' : 'unet',
                     generationRoute: model.generation_route || 'image',
                     usesSelectedCheckpoint: model.uses_selected_checkpoint === true,
-                    generationDefaults: model.generation_defaults || {}
+                    generationDefaults: model.generation_defaults || {},
+                    h3Task: model.generation_defaults && model.generation_defaults.task || ''
                 };
             });
         });

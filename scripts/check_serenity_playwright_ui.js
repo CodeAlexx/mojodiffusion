@@ -747,6 +747,10 @@ async function run() {
       modelResults.push(result);
     }
     for (const result of modelResults) {
+      if (process.env.SERENITY_H3_GENERATE_ONLY === "1"
+          && result.backend !== "minimax_h3") {
+        continue;
+      }
       assert(!result.error, `${result.name}: ${result.error}`);
       assert(result.selected === result.name, `${result.name}: picker selected ${result.selected}`);
       assert(result.nodes > 0, `${result.name}: generated an empty workflow`);
@@ -759,7 +763,16 @@ async function run() {
         assert(result.admitted, `${result.name}: route was not admitted ${JSON.stringify(result)}`);
       }
     }
-    const h3Model = modelResults.find((result) => result.backend === "minimax_h3");
+    const h3Models = modelResults.filter((result) => result.backend === "minimax_h3");
+    const h3Model = h3Models.find((result) => result.name === "MiniMax-H3-Mojo")
+      || h3Models[0];
+    const h3RefModel = h3Models.find(
+      (result) => result.name === "MiniMax-H3-Ref2VA-Mojo",
+    );
+    if (h3Model) {
+      assert(h3RefModel,
+        `MiniMax-H3 Ref2VA product card is missing: ${JSON.stringify(h3Models)}`);
+    }
     if (h3Model) {
       const expectedH3Attention = await page.evaluate(() => {
         const runners = GenerateTab.state.videoStatus
@@ -954,6 +967,53 @@ async function run() {
         && generateH3I2vaRequest.source_image === h3GenerateSource
         && generateH3I2vaRequest.prompt === "Playwright H3 Generate I2VA request",
       `H3 Generate dropped its selected I2VA source: ${JSON.stringify(generateH3I2vaRequest)}`);
+
+      await page.evaluate((name) => {
+        const search = document.querySelector("#gen-model-search");
+        search.value = "";
+        search.dispatchEvent(new Event("input", { bubbles: true }));
+        search.click();
+        const item = Array.from(document.querySelectorAll(".gen-model-dropdown-item"))
+          .find((candidate) => candidate.dataset.model === name);
+        if (!item) throw new Error(`H3 Ref2VA model ${name} is absent from Generate`);
+        item.click();
+      }, h3RefModel.name);
+      await page.waitForFunction(
+        (name) => GenerateTab.state.model === name && GenerateTab.state.h3Mode === "ref2va",
+        h3RefModel.name,
+      );
+      await page.locator("#gen-prompt").fill("Playwright H3 Generate Ref2VA request");
+      const generateH3Ref2vaBefore = videoRequests.length;
+      await page.locator("#gen-btn").click();
+      for (let attempt = 0;
+        attempt < 100 && videoRequests.length === generateH3Ref2vaBefore;
+        attempt += 1) {
+        await page.waitForTimeout(20);
+      }
+      assert(videoRequests.length === generateH3Ref2vaBefore + 1,
+        "H3 Generate Ref2VA did not POST /v1/video");
+      const generateH3Ref2vaRequest = videoRequests[videoRequests.length - 1];
+      assert(generateH3Ref2vaRequest.model === "minimax_h3"
+        && generateH3Ref2vaRequest.runner === "minimax_h3_mojo_request"
+        && generateH3Ref2vaRequest.task === "ref2va"
+        && generateH3Ref2vaRequest.source_image === h3GenerateSource
+        && generateH3Ref2vaRequest.prompt === "Playwright H3 Generate Ref2VA request",
+      `H3 Generate dropped its selected Ref2VA source: ${JSON.stringify(generateH3Ref2vaRequest)}`);
+
+      await page.evaluate((name) => {
+        const search = document.querySelector("#gen-model-search");
+        search.value = "";
+        search.dispatchEvent(new Event("input", { bubbles: true }));
+        search.click();
+        const item = Array.from(document.querySelectorAll(".gen-model-dropdown-item"))
+          .find((candidate) => candidate.dataset.model === name);
+        if (!item) throw new Error(`H3 Base model ${name} is absent from Generate`);
+        item.click();
+      }, h3Model.name);
+      await page.waitForFunction(
+        (name) => GenerateTab.state.model === name && GenerateTab.state.h3Mode === "t2va",
+        h3Model.name,
+      );
       await page.waitForFunction(() => {
         const panel = document.querySelector("#gen-metadata-panel");
         return panel && panel.classList.contains("visible");
@@ -999,6 +1059,10 @@ async function run() {
           i2va_request: {
             task: generateH3I2vaRequest.task,
             source_image: generateH3I2vaRequest.source_image,
+          },
+          ref2va_request: {
+            task: generateH3Ref2vaRequest.task,
+            source_image: generateH3Ref2vaRequest.source_image,
           },
         }));
         return;

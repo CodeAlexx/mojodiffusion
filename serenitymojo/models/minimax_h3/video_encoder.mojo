@@ -159,7 +159,7 @@ def conv3d(
     var k3 = kernel * kernel * kernel
 
     for oc in range(out_channels):
-        for ot in range(out_frames):
+        for out_time in range(out_frames):
             for oh in range(out_height):
                 for ow in range(out_width):
                     var acc = bias[oc]
@@ -170,7 +170,7 @@ def conv3d(
                                     var value = volume.data[
                                         volume.index(
                                             ic,
-                                            ot * stride_t + kt,
+                                            out_time * stride_t + kt,
                                             oh * stride_s + kh,
                                             ow * stride_s + kw,
                                         )
@@ -182,7 +182,7 @@ def conv3d(
                                     )
                                     acc += value * weight[weight_index]
                     var destination = (
-                        ((oc * out_frames + ot) * out_height + oh) * out_width + ow
+                        ((oc * out_frames + out_time) * out_height + oh) * out_width + ow
                     )
                     out[destination] = acc
     return Volume(out^, out_channels, out_frames, out_height, out_width)

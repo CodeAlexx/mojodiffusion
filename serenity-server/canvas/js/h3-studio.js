@@ -247,6 +247,7 @@ var H3StudioTab = (function () {
             '<label class="h3s-field"><span>Preferred segment · 5–15s</span><input class="h3s-input" type="number" min="5" max="15" step="0.041666667" data-endless-field="segment_seconds" value="' + attr(run.segment_seconds) + '"' + disabled(active) + '></label></div>' +
             '<label class="h3s-field"><span>Direction repeated for every continuation</span><textarea class="h3s-textarea" data-endless-field="continuation_direction"' + disabled(active) + '>' + escapeHtml(run.continuation_direction) + '</textarea></label>' +
             '<div class="h3s-button-row"><button class="h3s-btn is-primary" data-h3-action="start-endless"' + disabled(active) + '>Start endless story</button>' +
+            '<button class="h3s-btn" data-h3-action="resume-endless"' + disabled(!(run.status === 'failed' && run.active_job)) + '>Resume repaired job</button>' +
             '<button class="h3s-btn" data-h3-action="stop-endless"' + disabled(!active || run.status === 'stopping') + '>Stop after current</button>' +
             '<button class="h3s-btn is-quiet" data-h3-action="reset-endless"' + disabled(active) + '>Reset run</button></div>' +
             '<div class="h3s-endless-progress"><div><strong>' + completed + (planned ? ' / ' + planned : '') + '</strong> segments · ' + renderedFrames + ' frames / ' + Number(run.target_frames || 0) + ' · ' + C.secondsText(renderedFrames / C.NATIVE_FPS) + 's rendered' + activeText + '</div>' +
@@ -551,6 +552,7 @@ var H3StudioTab = (function () {
         else if (action === 'render-shot') renderShot();
         else if (action === 'continue-take') continueTake();
         else if (action === 'start-endless') startEndless();
+        else if (action === 'resume-endless') resumeFailedEndless();
         else if (action === 'stop-endless') stopEndless();
         else if (action === 'reset-endless') resetEndless();
     }
@@ -746,6 +748,23 @@ var H3StudioTab = (function () {
         }
         saveProject(); render();
         setStatus(run.status === 'stopped' ? 'Endless story stopped' : 'Stop requested · the active server job will finish, then no next segment will be submitted', '');
+    }
+
+    function resumeFailedEndless() {
+        var run = endlessState();
+        if (run.status !== 'failed' || !run.active_job) {
+            showToast('No failed Endless job is available to resume', 'error'); return;
+        }
+        try {
+            assertEndlessResumeSafe(run);
+            run.status = 'running'; run.error = ''; run.updated_at = new Date().toISOString();
+            saveProject(); render();
+            setStatus('Rechecking repaired ' + run.active_job.video_id + '…', 'live');
+            pollEndlessActive();
+        } catch (error) {
+            run.status = 'failed'; run.error = error.message; saveProject(); render();
+            setStatus(error.message, 'error'); showToast(error.message, 'error');
+        }
     }
 
     function resetEndless() {

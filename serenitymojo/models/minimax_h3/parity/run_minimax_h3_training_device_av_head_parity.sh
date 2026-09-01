@@ -8,14 +8,15 @@ fixture_dir="${script_dir}/fixtures"
 oracle="${script_dir}/minimax_h3_training_device_av_head_oracle.py"
 gate="${script_dir}/minimax_h3_training_device_av_head_parity.mojo"
 binary="/tmp/minimax_h3_training_device_av_head_parity"
+oracle_python="${H3_TORCH_ORACLE_PYTHON:-python3}"
 
 cd "${repo_root}"
-/home/alex/OneTrainer/venv/bin/python "${oracle}" --check
+"${oracle_python}" "${oracle}" --check
 generation_dir="$(mktemp -d /tmp/minimax-h3-av-head-generations.XXXXXX)"
 run_dir="$(mktemp -d /tmp/minimax-h3-av-head-runs.XXXXXX)"
 trap 'rm -rf "${generation_dir}" "${run_dir}"' EXIT
 for run_id in 1 2 3; do
-    /home/alex/OneTrainer/venv/bin/python "${oracle}" \
+    "${oracle_python}" "${oracle}" \
         --output "${generation_dir}/fixture_${run_id}.safetensors" >/dev/null
 done
 canonical_sha="$(sha256sum "${fixture_dir}/minimax_h3_training_device_av_head.safetensors" | awk '{print $1}')"

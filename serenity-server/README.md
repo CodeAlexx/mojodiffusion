@@ -32,9 +32,14 @@ shared media inspection and `tests.rs` contains route-level coverage. Keep
 model inference in Mojo: this Rust layer owns capability publication, request
 validation, queues, process lifecycle, and artifact delivery.
 
-MiniMax H3 follows an installed-software contract. Its canonical model appears
-and remains selectable when the checkpoint directory, compiled runner, model
-files, and linked GPU runtime libraries are present. Deleted generated videos,
+MiniMax H3 follows an installed-software contract. Generate and Models publish
+two checkpoint-family product cards: `MiniMax-H3 Base / FL2VA` is bound to the
+installed `FL2VA` tree, while `MiniMax-H3 References / Ref2VA` is bound to the
+separate learned `Ref2VA` tree. The Base card submits T2VA with no source and
+I2VA with one selected source image; the References card submits Ref2VA with
+the selected image as its visual reference. Both remain selectable when their
+checkpoint directory, compiled runner, model files, and linked GPU runtime
+libraries are present. Deleted generated videos,
 benchmark reports, product-gate JSON, conditioning caches, modulation caches,
 and INT8 resident caches do not hide or disable the model. BF16 starts directly;
 the first INT8 or INT8 Fast request builds its selected acceleration cache in a

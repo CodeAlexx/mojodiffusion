@@ -75,11 +75,12 @@
 
 from std.collections import Dict, List
 from max.gpu.host import DeviceContext, HostBuffer, DeviceEvent
-from std.memory import ArcPointer
+from std.memory import alloc, ArcPointer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
+from serenitymojo.io.ffi import BytePtr
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16_into
 from serenitymojo.ops.fp8_quant import fp8_e4m3_rowscale, fp8_e4m3_encode_perrow
@@ -182,6 +183,32 @@ struct MiniMaxH3BlockResidentFp8(Copyable, Movable):
         self.bf16 = bf16^
 
 
+struct MiniMaxH3HostRamCache(Movable):
+    """Owned anonymous-RAM mirror of a packed runtime cache.
+
+    The low-VRAM H3 path must not depend on Linux retaining a 19 GiB file
+    mapping in page cache between denoise steps.  The mapping is copied once
+    before denoise, then every per-block staging copy reads this allocation.
+    The request runner is process-isolated, but this owner still frees the
+    allocation deterministically when the resident store is destroyed.
+    """
+
+    var data: BytePtr
+    var nbytes: Int
+
+    def __init__(out self, nbytes: Int) raises:
+        if nbytes <= 0:
+            raise Error("MiniMax-H3 host-RAM cache must be non-empty")
+        self.data = rebind[BytePtr](alloc[UInt8](nbytes))
+        self.nbytes = nbytes
+
+    def ptr(self) -> BytePtr:
+        return self.data
+
+    def __del__(deinit self):
+        self.data.free()
+
+
 struct MiniMaxH3ResidentFp8(Copyable, Movable):
     """`blocks[i]` holds ABSOLUTE layer `start_layer + i` — the same
     contiguous-range convention `minimax_h3_run_stack` already uses, so a
@@ -211,6 +238,10 @@ struct MiniMaxH3ResidentFp8(Copyable, Movable):
     # pages of a held mapping stay reclaimable under memory pressure.
     var tail_st: List[ArcPointer[SafeTensors]]
     var tail_st_path: String
+    # Owned anonymous-RAM mirror of tail_st's data region.  When present,
+    # streamed-tail H2D staging reads only this allocation, never the file
+    # mapping.  One element by convention (List keeps the parent Copyable).
+    var tail_ram: List[ArcPointer[MiniMaxH3HostRamCache]]
     # Streamed-tail pinned staging (2026-08-22). The reusable one-block tail
     # used to stage EVERY tensor through a fresh pinned host allocation plus
     # ctx.synchronize() (12 cudaHostAlloc + 12 fences per block, 600 per
@@ -241,6 +272,7 @@ struct MiniMaxH3ResidentFp8(Copyable, Movable):
         self.scheme = scheme
         self.tail_st = List[ArcPointer[SafeTensors]]()
         self.tail_st_path = String("")
+        self.tail_ram = List[ArcPointer[MiniMaxH3HostRamCache]]()
         self.tail_stage = List[ArcPointer[HostBuffer[DType.uint8]]]()
         self.tail_stage_half_bytes = 0
         self.tail_stage_events = List[ArcPointer[DeviceEvent]]()

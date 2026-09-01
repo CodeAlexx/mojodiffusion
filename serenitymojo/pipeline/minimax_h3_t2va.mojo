@@ -270,11 +270,15 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     MINIMAX_H3_ATTN_SAGE_INT8_PV8,
     MINIMAX_H3_ATTN_SAGE_INT8_FAST,
     MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8,
+    MINIMAX_H3_ATTN_ADAPTIVE_SM120,
     MINIMAX_H3_SAGE_PV8_MIN_S,
     MINIMAX_H3_ATTN_SAGE_FAST_EXACT_PREFIX_BASE,
     MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE,
     MINIMAX_H3_ATTN_EVG_INT8,
     MINIMAX_H3_EVG_BUILD_ENABLED,
+    MINIMAX_H3_ADAPTIVE_SM120_BUILD_ENABLED,
+    MINIMAX_H3_ADAPTIVE_SM120_FAST_ROUTE_BUILD_ENABLED,
+    MINIMAX_H3_ADAPTIVE_SM120_TAU_X100,
     minimax_h3_released_config,
     minimax_h3_adaln_rows,
     minimax_h3_block_tensor_names,
@@ -284,12 +288,21 @@ from serenitymojo.models.dit.minimax_h3_dit import (
     minimax_h3_sage_exact_prefix_backend,
     minimax_h3_sage_fast_exact_prefix_backend,
     minimax_h3_comfy_kitchen_exact_prefix_backend,
+    minimax_h3_adaptive_sm120_backend_name,
+    minimax_h3_adaptive_sm120_tau,
 )
 from serenitymojo.ops.sage_attention_int8 import SageInt8Scratch
+from serenitymojo.ops.adaptive_block_attention_tiled_bf16 import (
+    AdaptiveBlockAttentionTiledScratch,
+)
 from serenitymojo.ops.comfy_kitchen_attention import (
     ComfyKitchenAttentionScratch,
 )
 from serenitymojo.ops.evg_attention_int8 import EVGH3RaggedLayout
+from serenitymojo.offload.vmm_cuda import (
+    cu_mem_get_info,
+    cu_mempool_trim_current,
+)
 from serenitymojo.models.minimax_h3.h3_lora_overlay import H3LoraOverlay
 from serenitymojo.models.dit.minimax_h3_loader_device import (
     minimax_h3_load_block_device,
@@ -313,6 +326,7 @@ from serenitymojo.models.dit.minimax_h3_modcache import (
 from serenitymojo.models.dit.minimax_h3_runtime_cache import (
     load_minimax_h3_modcache,
     load_minimax_h3_resident_cache,
+    prepare_minimax_h3_w8a8_host_ram_cache,
     reload_minimax_h3_resident_w8a8_block,
     save_minimax_h3_modcache,
     save_minimax_h3_resident_cache,
@@ -1708,6 +1722,10 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
     attention_backend: Int,
     sage_scratch: Optional[SageInt8Scratch],
     comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch],
+    adaptive_sm120_scratch: Optional[
+        AdaptiveBlockAttentionTiledScratch
+    ],
+    adaptive_sink_tokens: Int,
     evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]],
     step_index: Int,
     mut step_cache: MiniMaxH3StepCache,
@@ -1878,6 +1896,8 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
             evg_layout=evg_layout,
             evg_step=step_index,
             comfy_kitchen_scratch=comfy_kitchen_scratch,
+            adaptive_sm120_scratch=adaptive_sm120_scratch,
+            adaptive_sink_tokens=adaptive_sink_tokens,
         )
         # The block's last-use temporaries are stream-ordered but large enough
         # at S>=60k that carrying them into the next streamed weight load can
@@ -2070,6 +2090,11 @@ def _job_main(raw_args: List[String]) raises:
             attention_backend_name = String("evg-int8-sm86")
             sage_exact_av_prefix = False
             continue
+        if arg == String("--attention-backend=adaptive-sm120-sol-tau150"):
+            attention_backend = MINIMAX_H3_ATTN_ADAPTIVE_SM120
+            attention_backend_name = minimax_h3_adaptive_sm120_backend_name()
+            sage_exact_av_prefix = False
+            continue
         if arg == String("--attention-backend=cudnn"):
             attention_backend = MINIMAX_H3_ATTN_CUDNN
             attention_backend_name = String("cudnn")
@@ -2080,7 +2105,8 @@ def _job_main(raw_args: List[String]) raises:
                 String("unknown attention backend flag: ") + arg
                 + String(
                     " (expected cudnn, sage-int8, sage-int8-pv8,"
-                    " sage-int8-fast, ck-int8, or evg-int8)"
+                    " sage-int8-fast, ck-int8, evg-int8, or"
+                    " adaptive-sm120-sol-tau150)"
                 )
             )
         if arg == String("--step-cache=high"):
@@ -2223,6 +2249,30 @@ def _job_main(raw_args: List[String]) raises:
             "MiniMax-H3 EVG attention is not in this binary; rebuild with"
             " -D H3_EVG=1"
         )
+    if (
+        attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120
+        and not MINIMAX_H3_ADAPTIVE_SM120_BUILD_ENABLED
+    ):
+        raise Error(
+            "MiniMax-H3 adaptive SM120 attention is not in this binary;"
+            " rebuild with -D H3_ADAPTIVE_SM120=1"
+        )
+    if (
+        attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120
+        and not MINIMAX_H3_ADAPTIVE_SM120_FAST_ROUTE_BUILD_ENABLED
+    ):
+        raise Error(
+            "MiniMax-H3 adaptive SM120 accepted build requires"
+            " -D H3_ADAPTIVE_SM120_FAST_ROUTE=1"
+        )
+    if (
+        attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120
+        and MINIMAX_H3_ADAPTIVE_SM120_TAU_X100 != 150
+    ):
+        raise Error(
+            "MiniMax-H3 adaptive SM120 accepted build requires"
+            " -D H3_ADAPTIVE_SM120_TAU_X100=150"
+        )
     if quant == String("bf16"):
         use_resident = False
     elif quant == String("int8"):
@@ -2238,6 +2288,34 @@ def _job_main(raw_args: List[String]) raises:
             String("unknown --quant value: ") + quant
             + String(" (expected bf16, int8, or int8-fast)")
         )
+    if attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120:
+        if step_cache_enabled:
+            raise Error(
+                "MiniMax-H3 adaptive SM120 gate requires --step-cache=exact"
+            )
+        if quant != String("int8-fast"):
+            raise Error(
+                "MiniMax-H3 adaptive SM120 gate requires --quant=int8-fast"
+            )
+        if resident_scheme != MINIMAX_H3_RESIDENT_INT8_W8A8:
+            raise Error(
+                "MiniMax-H3 adaptive SM120 gate requires"
+                " --resident-backend=w8a8"
+            )
+        if resident_blocks_requested != 0:
+            raise Error(
+                "MiniMax-H3 adaptive SM120 gate requires --resident-blocks=0"
+            )
+        if encoder_storage != MINIMAX_H3_ENCODER_INT8:
+            raise Error(
+                "MiniMax-H3 adaptive SM120 gate requires"
+                " --encoder-storage=int8"
+            )
+        if not runtime_cache:
+            raise Error(
+                "MiniMax-H3 adaptive SM120 gate requires"
+                " --runtime-cache-exact-product-prompt"
+            )
     var _lora_overlay = Optional[H3LoraOverlay](None)
     if lora_path != String("") and use_resident and resident_blocks_requested == 0:
         raise Error("--lora with --resident-blocks=0 is unsupported (groupwise tail cache has no overlay)")
@@ -2255,7 +2333,7 @@ def _job_main(raw_args: List[String]) raises:
             "usage: minimax_h3_t2va <prompt> <out_dir> [steps=30] [seed=0]"
             " [max_blocks=50]"
             " [--attention-backend=cudnn|ck-int8|sage-int8|sage-int8-pv8|"
-            "sage-int8-fast|evg-int8]"
+            "sage-int8-fast|evg-int8|adaptive-sm120-sol-tau150]"
             " [--step-cache=exact|high]"
             " [--resident-backend=groupwise|w8a8]"
             " [--quant=bf16|int8|int8-fast]"
@@ -2293,6 +2371,13 @@ def _job_main(raw_args: List[String]) raises:
     var max_blocks = 50
     if len(args) >= 6:
         max_blocks = atol(String(args[5]))
+    if (
+        attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120
+        and max_blocks != 50
+    ):
+        raise Error(
+            "MiniMax-H3 adaptive SM120 gate requires all 50 transformer blocks"
+        )
     var decode_only_request = (
         len(args) >= 7
         and (
@@ -2381,7 +2466,11 @@ def _job_main(raw_args: List[String]) raises:
         print(
             "  resident policy: exact S=", sequence_length,
             "exceeds", MINIMAX_H3_FAST_RESIDENT_EXACT_SEQUENCE_LIMIT,
-            "; using streamed weights",
+            (
+                "; using host-resident W8A8 tail"
+                if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
+                else "; using streamed weights"
+            ),
         )
         resident_blocks_requested = 0
     if sage_exact_av_prefix and not motion_context_enabled:
@@ -2469,6 +2558,42 @@ def _job_main(raw_args: List[String]) raises:
         var decode_mode = String(args[6])
         var ctx2 = DeviceContext()
         print(" ", decode_mode, ": loading", out_dir + "/latents.safetensors")
+        # The production denoiser already writes audio.wav before it exits.
+        # Native long-video decode must not load BigVGAN in the fresh video-VAE
+        # process: the two decoder working sets exceed a 16 GiB card even
+        # though either decoder fits independently.  This mode loads only the
+        # video rows, streams frames, then muxes the preserved audio artifact.
+        if decode_mode == "decode_video_only":
+            var video_st = SafeTensors.open(out_dir + "/latents.safetensors")
+            var video_info = video_st.tensor_info("video_state_rows")
+            var video_only_rows = Tensor.from_view(
+                from_parts(
+                    video_info.dtype,
+                    video_info.shape.copy(),
+                    video_st.tensor_bytes("video_state_rows"),
+                ),
+                ctx2,
+            )
+            print("  video rows", video_only_rows.shape())
+            _assert_finite_rows("video_state_rows", video_only_rows, ctx2)
+            var video_config = minimax_h3_released_config()
+            var video_frames = _minimax_h3_decode_video(
+                video_only_rows, num_latent_frames, latent_h, latent_w,
+                video_config.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx2,
+            )
+            var video_artifact = _minimax_h3_mux_av(
+                out_dir, output_frames, runtime_width, runtime_height,
+                runtime_fps, output_fps, trim_start_frames,
+            )
+            _minimax_h3_write_decode_result(
+                out_dir, video_artifact, output_frames, runtime_width,
+                runtime_height, output_fps,
+            )
+            print(
+                "  DECODE-VIDEO-ONLY done:", video_frames,
+                "frames + preserved audio.wav +", video_artifact,
+            )
+            return
         var lat_st = SafeTensors.open(out_dir + "/latents.safetensors")
         var vinfo = lat_st.tensor_info("video_state_rows")
         var video_rows = Tensor.from_view(
@@ -2497,13 +2622,6 @@ def _job_main(raw_args: List[String]) raises:
                 video_rows, num_latent_frames, latent_h, latent_w,
                 config2.latents_dim, String(VIDEO_VAE_DIR), out_dir, ctx2,
             )
-            if decode_mode == "decode_video_only":
-                print(
-                    "  DECODE-VIDEO-ONLY done:", nframes, "frames ->",
-                    out_dir + "/frames.rgb",
-                )
-                return
-
         var artifact = _minimax_h3_mux_av(
             out_dir, output_frames, runtime_width, runtime_height,
             runtime_fps, output_fps, trim_start_frames,
@@ -2756,6 +2874,30 @@ def _job_main(raw_args: List[String]) raises:
     if len(geometry.audio_indices) \
             != num_condition_audio_rows + num_audio_rows:
         raise Error("minimax_h3_t2va: audio row count mismatch")
+    var adaptive_sink_tokens = 0
+    if attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120:
+        var target_video_index = geometry.num_condition_video_rows
+        if target_video_index >= len(geometry.video_indices):
+            raise Error(
+                "MiniMax-H3 adaptive SM120 layout has no target video rows"
+            )
+        adaptive_sink_tokens = geometry.video_indices[target_video_index]
+        if adaptive_sink_tokens <= 0:
+            raise Error(
+                "MiniMax-H3 adaptive SM120 layout requires a non-empty sink"
+            )
+        if adaptive_sink_tokens + num_video_rows != geometry.sequence_length:
+            raise Error(
+                "MiniMax-H3 adaptive SM120 sink does not start the target"
+                " video tail"
+            )
+        if (
+            geometry.video_indices[len(geometry.video_indices) - 1]
+            != geometry.sequence_length - 1
+        ):
+            raise Error(
+                "MiniMax-H3 adaptive SM120 target video tail is not contiguous"
+            )
 
     # Experimental one-pass long-context position interpolation. H3 was
     # released for at most 15 seconds, so an unscaled 60-second target drives
@@ -2934,11 +3076,21 @@ def _job_main(raw_args: List[String]) raises:
                     resident_scheme,
                 )
             )
-            print("  resident cache: reusable one-block W8A8 tail ready")
+            prepare_minimax_h3_w8a8_host_ram_cache(
+                reusable_w8a8_tail.value(),
+                resident_cache_path,
+                String(TRANSFORMER_INDEX),
+            )
+            print("  resident cache: reusable host-RAM W8A8 tail ready")
         var t_q1 = perf_counter_ns()
         print(
             "  fp8-resident: ", resident_blocks, " blocks + ",
-            run_config.num_layers - resident_blocks, " streamed tail, ",
+            run_config.num_layers - resident_blocks,
+            (
+                " host-RAM tail, "
+                if resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
+                else " streamed tail, "
+            ),
             Float64(fp8_resident.value().resident_bytes())
             / (1024.0 * 1024.0 * 1024.0),
             " GiB resident (", Float64(t_q1 - t_q0) / 1.0e9, "s one-time)",
@@ -3012,6 +3164,13 @@ def _job_main(raw_args: List[String]) raises:
             " packed_rows=", evg_layout.value()[].packed_rows,
         )
 
+    # The P6 candidate owns one run-lifetime scratch, but allocates it only
+    # when evaluation 10 first admits P6. The first ten CK evaluations do not
+    # carry its 1.29-GiB working set; CK scratch is released before P6 arrives.
+    var adaptive_sm120_scratch = Optional[
+        AdaptiveBlockAttentionTiledScratch
+    ](None)
+
     # Sage attention runs the whole denoise through one preallocated scratch:
     # its per-call transient buffers otherwise churn ~1-2 GiB fifty times per
     # evaluation and intermittently OOM near the 24-GiB envelope
@@ -3021,6 +3180,7 @@ def _job_main(raw_args: List[String]) raises:
     if (
         attention_backend != MINIMAX_H3_ATTN_CUDNN
         and attention_backend != MINIMAX_H3_ATTN_EVG_INT8
+        and attention_backend != MINIMAX_H3_ATTN_ADAPTIVE_SM120
         and attention_backend < MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE
         and attention_backend != MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
     ):
@@ -3049,6 +3209,10 @@ def _job_main(raw_args: List[String]) raises:
         attention_backend == MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8
         or attention_backend
             >= MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE
+        or (
+            attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120
+            and eval_start < 10
+        )
     ):
         comfy_kitchen_scratch = Optional[ComfyKitchenAttentionScratch](
             ComfyKitchenAttentionScratch(
@@ -3063,7 +3227,43 @@ def _job_main(raw_args: List[String]) raises:
             "GiB for S=", geometry.sequence_length,
         )
     var step_cache = MiniMaxH3StepCache(step_cache_enabled, num_steps)
+    var adaptive_ck_calls_total = 0
+    var adaptive_cudnn_calls_total = 0
+    var adaptive_p6_calls_total = 0
     for i in range(eval_start, eval_stop):
+        if (
+            attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120
+            and i >= 10
+            and not adaptive_sm120_scratch
+        ):
+            ctx.synchronize()
+            if comfy_kitchen_scratch:
+                comfy_kitchen_scratch = Optional[
+                    ComfyKitchenAttentionScratch
+                ](None)
+                ctx.synchronize()
+            cu_mempool_trim_current(0)
+            var adaptive_mem_before = cu_mem_get_info()
+            adaptive_sm120_scratch = Optional[
+                AdaptiveBlockAttentionTiledScratch
+            ](
+                AdaptiveBlockAttentionTiledScratch(
+                    1, geometry.sequence_length, H3_HEADS, ctx
+                )
+            )
+            ctx.synchronize()
+            var adaptive_mem_after = cu_mem_get_info()
+            print(
+                "  adaptive-sm120-sol-tau150 scratch: bytes=",
+                adaptive_sm120_scratch.value().resident_bytes(),
+                " sink_tokens=", adaptive_sink_tokens,
+                " tau=", minimax_h3_adaptive_sm120_tau(),
+                " fast_route=1",
+                " free_before_mib=",
+                adaptive_mem_before.free_bytes // (1024 * 1024),
+                " free_after_mib=",
+                adaptive_mem_after.free_bytes // (1024 * 1024),
+            )
         var t_step0 = perf_counter_ns()
         var video_ts = schedule.video_timestep(i)
         var audio_ts = schedule.audio_timestep(i)
@@ -3149,6 +3349,7 @@ def _job_main(raw_args: List[String]) raises:
                 _lora_overlay, rope[0],
                 rope[1], rotary_dim, attention_backend, sage_scratch,
                 comfy_kitchen_scratch,
+                adaptive_sm120_scratch, adaptive_sink_tokens,
                 evg_layout, i,
                 step_cache, False,
                 ctx,
@@ -3177,6 +3378,7 @@ def _job_main(raw_args: List[String]) raises:
                 _lora_overlay, rope[0],
                 rope[1], rotary_dim, attention_backend, sage_scratch,
                 comfy_kitchen_scratch,
+                adaptive_sm120_scratch, adaptive_sink_tokens,
                 evg_layout, i,
                 step_cache, True,
                 ctx,
@@ -3194,6 +3396,27 @@ def _job_main(raw_args: List[String]) raises:
             " video_t=", video_ts, " audio_t=", audio_ts,
             " (", Float64(t_step1 - t_step0) / 1.0e9, "s)",
         )
+        if attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120:
+            var adaptive_ck_calls = 50 if i < 10 else 0
+            var adaptive_cudnn_calls = 0 if i < 10 else 2
+            var adaptive_p6_calls = 0 if i < 10 else 48
+            adaptive_ck_calls_total += adaptive_ck_calls
+            adaptive_cudnn_calls_total += adaptive_cudnn_calls
+            adaptive_p6_calls_total += adaptive_p6_calls
+            cu_mempool_trim_current(0)
+            var adaptive_eval_mem = cu_mem_get_info()
+            print(
+                "  adaptive-sm120-sol-tau150 calls: eval_ck=",
+                adaptive_ck_calls, " eval_cudnn=", adaptive_cudnn_calls,
+                " eval_p6=", adaptive_p6_calls,
+                " cumulative_ck=", adaptive_ck_calls_total,
+                " cumulative_cudnn=", adaptive_cudnn_calls_total,
+                " cumulative_p6=", adaptive_p6_calls_total,
+                " free_after_eval_mib=",
+                adaptive_eval_mem.free_bytes // (1024 * 1024),
+                " used_after_eval_mib=",
+                adaptive_eval_mem.used_bytes() // (1024 * 1024),
+            )
 
     # The boundary is source state, not generated output. Restore the exact
     # clean A/V rows before checkpointing and decode; decode removes the head.
@@ -3355,7 +3578,7 @@ def _job_main(raw_args: List[String]) raises:
             String("resident-int8-") + resident_backend_name + String("-")
             + String(resident_blocks_requested)
             + (
-                String("+streamed-w8a8-cache-tail")
+                String("+host-resident-w8a8-tail")
                 if (
                     resident_scheme == MINIMAX_H3_RESIDENT_INT8_W8A8
                 )

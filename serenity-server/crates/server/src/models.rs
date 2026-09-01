@@ -20,11 +20,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use axum::extract::{Json, Path as AxPath, Query};
-use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const LTX2_FEATURE_ADAPTERS_JSON: &str =
     include_str!("../../../../serenitymojo/configs/ltx2_feature_adapters.json");
@@ -1714,24 +1714,42 @@ fn scan_checkpoints_uncached() -> Vec<ScanEntry> {
             });
         }
     }
-    // MiniMax-H3 is a multi-directory audio/video model. Installed model
-    // identity is a filesystem fact, not a benchmark verdict: validation
-    // reports may describe confidence, but never hide a user's model.
-    let name = "MiniMax-H3-Mojo";
-    let dir = format!("{checkpoints}/MiniMax-H3");
-    if dir_exists(&dir) && directory_identities.insert(name.to_string()) {
-        out.push(ScanEntry {
-            name: name.to_string(),
-            path: dir.clone(),
-            arch: "minimax-h3".to_string(),
-            detected_arch: "minimax-h3".to_string(),
-            arch_source: "bundled_identity".to_string(),
-            arch_override: String::new(),
-            format: "diffusers_directory".to_string(),
-            size: du_sb(&dir),
-            folder: folder_relative_to(&dir, &checkpoints),
-            sidecar: sidecar_for_dir(&dir),
+    // MiniMax-H3 ships two different learned checkpoint families. Preserve the
+    // existing Base identity for saved UI state, but bind it to the exact
+    // FL2VA tree and publish Ref2VA as its own selectable product identity.
+    // The recursive Diffusers scanner sees these directories too; replace
+    // those generic rows so the Models and Generate surfaces show one truthful
+    // product card per checkpoint family instead of a disabled duplicate.
+    for (name, subdir) in [
+        ("MiniMax-H3-Mojo", "FL2VA"),
+        ("MiniMax-H3-Ref2VA-Mojo", "Ref2VA"),
+    ] {
+        let dir = format!("{checkpoints}/MiniMax-H3/{subdir}");
+        if !dir_exists(&dir) {
+            continue;
+        }
+        let canonical_dir = std::fs::canonicalize(&dir).ok();
+        out.retain(|entry| {
+            canonical_dir.as_ref().is_none_or(|canonical| {
+                std::fs::canonicalize(&entry.path)
+                    .map(|entry_path| entry_path != *canonical)
+                    .unwrap_or(true)
+            })
         });
+        if directory_identities.insert(name.to_string()) {
+            out.push(ScanEntry {
+                name: name.to_string(),
+                path: dir.clone(),
+                arch: "minimax-h3".to_string(),
+                detected_arch: "minimax-h3".to_string(),
+                arch_source: "bundled_identity".to_string(),
+                arch_override: String::new(),
+                format: "diffusers_directory".to_string(),
+                size: du_sb(&dir),
+                folder: folder_relative_to(&dir, &checkpoints),
+                sidecar: sidecar_for_dir(&dir),
+            });
+        }
     }
     // known multi-shard checkpoint subdirs under checkpoints/.
     for (name, arch) in [
@@ -1984,8 +2002,30 @@ fn lora_incompatible_reason(
 
 fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
     let arch = entry_arch(e);
-    let generation_defaults =
-        crate::capabilities::generation_defaults_for_model_arch(&e.name, &arch);
+    let generation_defaults = if arch == "minimax-h3" {
+        match e.name.as_str() {
+            "MiniMax-H3-Mojo" => Some(json!({
+                "source": "server_model_profile",
+                "task": "t2va",
+                "checkpoint_family": "FL2VA",
+                "requires_reference": false,
+            })),
+            "MiniMax-H3-Ref2VA-Mojo" => Some(json!({
+                "source": "server_model_profile",
+                "task": "ref2va",
+                "checkpoint_family": "Ref2VA",
+                "requires_reference": true,
+            })),
+            _ => None,
+        }
+    } else {
+        crate::capabilities::generation_defaults_for_model_arch(&e.name, &arch)
+    };
+    let card_title = match e.name.as_str() {
+        "MiniMax-H3-Mojo" => "MiniMax-H3 Base / FL2VA",
+        "MiniMax-H3-Ref2VA-Mojo" => "MiniMax-H3 References / Ref2VA",
+        _ => e.name.as_str(),
+    };
     let loaded = !resident.is_empty() && e.name == resident;
     let preview = e.sidecar.preview.clone();
     let selected_checkpoint_scope = entry_selected_checkpoint_scope(e);
@@ -2031,6 +2071,7 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
                 | ("bernini", "Bernini-R-Diffusers")
                 | ("scail2", "SCAIL-2-Mojo")
                 | ("minimax-h3", "MiniMax-H3-Mojo")
+                | ("minimax-h3", "MiniMax-H3-Ref2VA-Mojo")
         );
     let blocked_reason = crate::capabilities::blocked_image_model_reason(&e.name);
     let runtime_supported = blocked_reason.is_none()
@@ -2073,7 +2114,7 @@ fn model_entry_json(e: &ScanEntry, resident: &str) -> Value {
     });
     let card = json!({
         "schema": "serenity.model.card.v1",
-        "title": e.name,
+        "title": card_title,
         "subtitle": arch,
         "path": e.path,
         "arch": arch,
@@ -2871,6 +2912,33 @@ mod tests {
         assert_eq!(bundled_lens["generation_defaults"]["steps"], 20);
         assert_eq!(bundled_lens["card"]["generation_defaults"]["cfg"], 5.0);
 
+        let h3_base = model_entry_json(
+            &entry("MiniMax-H3-Mojo", "minimax-h3", "diffusers_directory"),
+            "",
+        );
+        assert_eq!(h3_base["runtime_supported"], true);
+        assert_eq!(h3_base["selected_checkpoint_scope"], "video_route");
+        assert_eq!(h3_base["generation_defaults"]["task"], "t2va");
+        assert_eq!(h3_base["generation_defaults"]["checkpoint_family"], "FL2VA");
+        assert_eq!(h3_base["card"]["title"], "MiniMax-H3 Base / FL2VA");
+
+        let h3_ref2va = model_entry_json(
+            &entry(
+                "MiniMax-H3-Ref2VA-Mojo",
+                "minimax-h3",
+                "diffusers_directory",
+            ),
+            "",
+        );
+        assert_eq!(h3_ref2va["runtime_supported"], true);
+        assert_eq!(h3_ref2va["selected_checkpoint_scope"], "video_route");
+        assert_eq!(h3_ref2va["generation_defaults"]["task"], "ref2va");
+        assert_eq!(
+            h3_ref2va["generation_defaults"]["checkpoint_family"],
+            "Ref2VA"
+        );
+        assert_eq!(h3_ref2va["card"]["title"], "MiniMax-H3 References / Ref2VA");
+
         let arbitrary_zimage_turbo = model_entry_json(
             &entry("z_image_turbo_bf16", "zimage", "diffusion_model"),
             "",
@@ -2895,10 +2963,12 @@ mod tests {
             "",
         );
         assert_eq!(blocked_l2p["runtime_supported"], false);
-        assert!(blocked_l2p["runtime_reason"]
-            .as_str()
-            .unwrap_or("")
-            .contains("no production serenity-server worker route"));
+        assert!(
+            blocked_l2p["runtime_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no production serenity-server worker route")
+        );
 
         let ltx_product =
             model_entry_json(&entry("ltx-2.3-22b-dev-fp8", "ltx2", "diffusion_model"), "");
@@ -2952,10 +3022,12 @@ mod tests {
         let nava = model_entry_json(&entry("NAVA/NAVA_fp8", "nava", "diffusion_model"), "");
         assert_eq!(nava["generation_route"], "video");
         assert_eq!(nava["runtime_supported"], false);
-        assert!(nava["runtime_reason"]
-            .as_str()
-            .unwrap()
-            .contains("not one of the compiled video product profiles"));
+        assert!(
+            nava["runtime_reason"]
+                .as_str()
+                .unwrap()
+                .contains("not one of the compiled video product profiles")
+        );
 
         let mut classified_video = entry("creator-video", "ltx2", "diffusion_model");
         classified_video.detected_arch = "unknown".to_string();

@@ -72,6 +72,7 @@ var GenerateTab = (function () {
         videoPromptEnhancer: 'none',
         videoQuant: 'fp8',
         h3Quant: 'int8-fast',
+        h3Mode: 't2va',
         h3AttentionBackend: 'ck-int8',
         h3StepCache: 'exact',
         cameraMotion: 'none',
@@ -2918,8 +2919,9 @@ var GenerateTab = (function () {
             var card = document.createElement('button');
             card.className = 'gen-library-card gen-library-model-card';
             card.type = 'button';
-            card.textContent = model.name;
-            card.title = model.name;
+            card.textContent = model.displayName || model.name;
+            card.title = model.displayName || model.name;
+            card.dataset.model = model.name;
             card.classList.toggle('active', model.name === state.model);
             card.addEventListener('click', function () { selectModel(model.name); renderModelLibrary(); });
             list.appendChild(card);
@@ -3170,19 +3172,23 @@ var GenerateTab = (function () {
             }
             els.model.value = pick.name;
             state.model = pick.name;
+            if (ModelUtils.archForModel(pick.name) === 'minimax_h3') {
+                state.h3Mode = pick.h3Task === 'ref2va' ? 'ref2va' : 't2va';
+            }
             var globalBadge = document.querySelector('#topbar .model-badge');
             if (globalBadge) {
-                globalBadge.textContent = pick.name;
-                globalBadge.title = pick.name;
+                globalBadge.textContent = pick.displayName || pick.name;
+                globalBadge.title = pick.displayName || pick.name;
             }
             if (els.modelSearch) {
-                els.modelSearch.value = pick.name;
+                els.modelSearch.value = pick.displayName || pick.name;
                 els.modelSearch.placeholder = 'Search models...';
             }
             updateUIForArch(ModelUtils.archForModel(pick.name));
             ModelUtils.warmModel(pick.name, {
                 checkpoint: state.videoCheckpoint,
-                quant: state.videoQuant,
+                quant: ModelUtils.archForModel(pick.name) === 'minimax_h3'
+                    ? state.h3Quant : state.videoQuant,
                 task: state.h3Mode || 't2va'
             });
             els.modelWarn.classList.remove('visible');
@@ -3739,10 +3745,13 @@ var GenerateTab = (function () {
         if (els.cameraMotion && els.cameraMotion.closest('.gen-param-row'))
             els.cameraMotion.closest('.gen-param-row').style.display = 'none';
         var profileNote = document.getElementById('gen-video-profile-note');
-        if (profileNote)
+        if (profileNote) {
             profileNote.textContent = runnerReady
-                ? 'H3 width and height are adjustable from 32–2048 in 32-pixel steps, up to 1,032,192 pixels. The listed sizes are tested presets, not a lock. H3 is trained through 15 seconds; lower resolutions expose experimental single-pass long context up to their token-budgeted limit. INT8 caches build automatically on first use; BF16 starts directly.'
+                ? (state.h3Mode === 'ref2va'
+                    ? 'MiniMax-H3 Ref2VA uses the installed Ref2VA checkpoint family. Select a source image below as its visual reference; richer ordered image, video, and audio references remain available in H3 Studio.'
+                    : 'MiniMax-H3 Base uses the installed FL2VA checkpoint family. With no source it runs T2VA; one selected source image runs I2VA. Width and height remain adjustable inside the published H3 envelope.')
                 : 'MiniMax-H3 controls remain visible, but a required model file, runner, or GPU runtime library is missing.';
+        }
         var advancedNote = document.getElementById('gen-video-advanced-note');
         if (advancedNote)
             advancedNote.textContent = 'H3 runs entirely on GPU, exits after denoising, decodes in a fresh GPU process, and muxes with NVENC.';
@@ -3752,7 +3761,9 @@ var GenerateTab = (function () {
             els.modelWarn.classList.toggle('visible', !runnerReady);
         }
         if (els.btn)
-            els.btn.innerHTML = '<i data-lucide="wand-2"></i><span>Generate H3 Video + Audio</span>';
+            els.btn.innerHTML = state.h3Mode === 'ref2va'
+                ? '<i data-lucide="wand-2"></i><span>Generate H3 Reference Video + Audio</span>'
+                : '<i data-lucide="wand-2"></i><span>Generate H3 Video + Audio</span>';
         var output = document.getElementById('gen-output-format');
         if (output)
             output.value = 'MP4';
@@ -4434,11 +4445,13 @@ var GenerateTab = (function () {
         }
         if (state.arch === 'minimax_h3') {
             var h3SourceImage = String(state.initImagePath || '').trim();
+            var h3Task = state.h3Mode === 'ref2va'
+                ? 'ref2va' : (h3SourceImage ? 'i2va' : 't2va');
             var h3Request = {
                 schema: 'serenity.genparams.v1',
                 model: 'minimax_h3',
                 runner: 'minimax_h3_mojo_request',
-                task: h3SourceImage ? 'i2va' : 't2va',
+                task: h3Task,
                 prompt: finalPrompt.trim(),
                 width: state.width,
                 height: state.height,
@@ -4458,9 +4471,10 @@ var GenerateTab = (function () {
                 include_audio: true
             };
             // Generate's source-image picker is shared by the image/video
-            // surfaces. H3 requires the exact server upload path plus an I2VA
-            // task label; leaving either out silently runs T2VA even though the
-            // preview still shows a selected source image.
+            // surfaces. The Base/FL2VA card interprets one selected image as
+            // I2VA; the Ref2VA card sends the same exact server path as its
+            // single ordered visual reference. No source remains explicit
+            // T2VA for Base and fails Ref2VA admission before GPU work.
             if (h3SourceImage)
                 h3Request.source_image = h3SourceImage;
             return h3Request;
@@ -5488,14 +5502,24 @@ var GenerateTab = (function () {
             els.modelDropdown.style.display = 'none';
         // Restore display name
         if (els.modelSearch && state.model) {
-            els.modelSearch.value = state.model;
+            var selected = state.allModels.find(function (model) {
+                return model && model.name === state.model;
+            });
+            els.modelSearch.value = selected && selected.displayName || state.model;
         }
     }
     function selectModel(name) {
         state.model = name;
         els.model.value = name;
+        var selected = state.allModels.find(function (model) {
+            return model && model.name === name;
+        });
+        if (ModelUtils.archForModel(name) === 'minimax_h3') {
+            state.h3Mode = selected && selected.h3Task === 'ref2va'
+                ? 'ref2va' : 't2va';
+        }
         if (els.modelSearch)
-            els.modelSearch.value = name;
+            els.modelSearch.value = selected && selected.displayName || name;
         closeModelDropdown();
         var checkpoint = name.replace(/\.safetensors$/i, '');
         if (ModelUtils.archForModel(name) === 'ltxv') {
@@ -5527,8 +5551,8 @@ var GenerateTab = (function () {
         updateUIForArch(ModelUtils.archForModel(name));
         var globalBadge = document.querySelector('#topbar .model-badge');
         if (globalBadge) {
-            globalBadge.textContent = name;
-            globalBadge.title = name;
+            globalBadge.textContent = selected && selected.displayName || name;
+            globalBadge.title = selected && selected.displayName || name;
         }
         ModelUtils.warmModel(name, {
             checkpoint: state.videoCheckpoint,
@@ -5543,7 +5567,8 @@ var GenerateTab = (function () {
         var models = state.allModels || [];
         var query = state.modelSearchQuery || '';
         var filtered = models.filter(function (m) {
-            return !query || m.name.toLowerCase().indexOf(query) >= 0;
+            return !query || m.name.toLowerCase().indexOf(query) >= 0 ||
+                String(m.displayName || '').toLowerCase().indexOf(query) >= 0;
         });
         // Group by architecture
         var groups = {};
@@ -5572,7 +5597,7 @@ var GenerateTab = (function () {
                 groups[arch].forEach(function (m) {
                     var archVal = ModelUtils.archForModel(m.name) || 'other';
                     html += '<div class="gen-model-dropdown-item" data-model="' + m.name + '">' +
-                        '<span class="gen-model-dropdown-name">' + m.name + '</span>' +
+                        '<span class="gen-model-dropdown-name">' + (m.displayName || m.name) + '</span>' +
                         '<span class="gen-arch-badge" data-arch="' + archVal + '">' + (groupLabels[archVal] || archVal.toUpperCase()) + '</span>' +
                         '</div>';
                 });

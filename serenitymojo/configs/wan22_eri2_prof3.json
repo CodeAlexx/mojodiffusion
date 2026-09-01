@@ -1,0 +1,23 @@
+{
+ "model_type": "wan22",
+ "checkpoint": "/home/alex/.serenity/models/checkpoints/Bernini-R-Diffusers/serenity_fp8_e4m3_de8c462/low",
+ "network_algorithm": "lora",
+ "lora_rank": 16,
+ "lora_alpha": 16.0,
+ "learning_rate": 0.0001,
+ "max_steps": 3,
+ "save_every": 0,
+ "sample_every": 0,
+ "seed": 42,
+ "cache_dir": "/home/alex/.serenity/wan22_cache/eri2_with_trigger_256",
+ "optimizer": {
+  "eps": 1e-08,
+  "weight_decay": 0.01,
+  "beta1": 0.9,
+  "beta2": 0.999
+ },
+ "dataset_cache_dir": "/home/alex/.serenity/wan22_cache/eri2_with_trigger_256",
+ "dit_high_noise": "/home/alex/.serenity/models/checkpoints/Bernini-R-Diffusers/serenity_fp8_e4m3_de8c462/high",
+ "quantized_resident": "fp8_e4m3",
+ "dual_expert": true
+}

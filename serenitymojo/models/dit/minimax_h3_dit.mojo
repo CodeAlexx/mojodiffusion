@@ -88,7 +88,14 @@ from serenitymojo.ops.sage_attention_int8 import (
 )
 from serenitymojo.ops.comfy_kitchen_attention import (
     ComfyKitchenAttentionScratch,
+    comfy_kitchen_attention_current_sm,
     comfy_kitchen_attention_fwd_scratch,
+)
+from serenitymojo.ops.adaptive_block_attention_tiled_bf16 import (
+    AdaptiveBlockAttentionTiledScratch,
+)
+from serenitymojo.ops.adaptive_block_attention_sm120_bf16 import (
+    adaptive_block_attention_sm120_bf16,
 )
 from serenitymojo.ops.evg_attention_int8 import (
     EVGH3RaggedLayout,
@@ -131,6 +138,7 @@ comptime MINIMAX_H3_ATTN_EVG_INT8 = 2
 comptime MINIMAX_H3_ATTN_SAGE_INT8_PV8 = 3
 comptime MINIMAX_H3_ATTN_SAGE_INT8_FAST = 4
 comptime MINIMAX_H3_ATTN_COMFY_KITCHEN_INT8 = 5
+comptime MINIMAX_H3_ATTN_ADAPTIVE_SM120 = 6
 # H=56 crossover measured on RTX 3090 Ti at exact H3 shapes. PV8 loses below
 # this point; the adaptive backend retains BF16-PV there.
 comptime MINIMAX_H3_SAGE_PV8_MIN_S = 13312
@@ -138,6 +146,28 @@ comptime MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE = 100000
 comptime MINIMAX_H3_ATTN_SAGE_FAST_EXACT_PREFIX_BASE = 200000
 comptime MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE = 300000
 comptime MINIMAX_H3_EVG_BUILD_ENABLED = get_defined_int["H3_EVG", 0]() != 0
+comptime MINIMAX_H3_ADAPTIVE_SM120_BUILD_ENABLED = (
+    get_defined_int["H3_ADAPTIVE_SM120", 0]() != 0
+)
+comptime MINIMAX_H3_ADAPTIVE_SM120_FAST_ROUTE_BUILD_ENABLED = (
+    get_defined_int["H3_ADAPTIVE_SM120_FAST_ROUTE", 0]() != 0
+)
+comptime MINIMAX_H3_ADAPTIVE_SM120_TAU_X100 = get_defined_int[
+    "H3_ADAPTIVE_SM120_TAU_X100", 100
+]()
+comptime MINIMAX_H3_ADAPTIVE_SM120_TAU = (
+    Float32(MINIMAX_H3_ADAPTIVE_SM120_TAU_X100) / Float32(100.0)
+)
+
+
+def minimax_h3_adaptive_sm120_backend_name() -> String:
+    """Stable name for the one accepted compile-time-dark SM120 candidate."""
+    return "adaptive-sm120-sol-tau150"
+
+
+def minimax_h3_adaptive_sm120_tau() -> Float32:
+    """Compile-time-dark candidate threshold, exposed for run evidence."""
+    return MINIMAX_H3_ADAPTIVE_SM120_TAU
 
 
 def minimax_h3_sage_exact_prefix_backend(prefix_rows: Int) raises -> Int:
@@ -171,8 +201,12 @@ def _minimax_h3_attention_dispatch(
     evg_step: Int = 0,
     evg_layer: Int = 0,
     comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
+    adaptive_sm120_scratch: Optional[
+        AdaptiveBlockAttentionTiledScratch
+    ] = None,
+    adaptive_sink_tokens: Int = 0,
 ) raises -> Tensor:
-    """Exact cuDNN, Sage, or source-scheduled EVG sparse attention.
+    """Dispatch exact cU-DNN or explicitly selected experimental backends.
 
     When `sage_scratch` is provided, Sage runs with zero device allocations
     through the run-lifetime scratch; without it, every call allocates and
@@ -182,6 +216,70 @@ def _minimax_h3_attention_dispatch(
     """
     if attention_backend == MINIMAX_H3_ATTN_CUDNN:
         return sdpa_flash_infer_fwd_dynamic(q, k, v, scale, ctx)
+    if attention_backend == MINIMAX_H3_ATTN_ADAPTIVE_SM120:
+        comptime if MINIMAX_H3_ADAPTIVE_SM120_BUILD_ENABLED:
+            comptime if not MINIMAX_H3_ADAPTIVE_SM120_FAST_ROUTE_BUILD_ENABLED:
+                raise Error(
+                    "MiniMax-H3 adaptive SM120 accepted build requires"
+                    " -D H3_ADAPTIVE_SM120_FAST_ROUTE=1"
+                )
+            comptime if MINIMAX_H3_ADAPTIVE_SM120_TAU_X100 != 150:
+                raise Error(
+                    "MiniMax-H3 adaptive SM120 accepted build requires"
+                    " -D H3_ADAPTIVE_SM120_TAU_X100=150"
+                )
+            if sage_ultravico:
+                raise Error(
+                    "MiniMax-H3 adaptive SM120 does not support UltraViCo"
+                )
+            var shape = q.shape()
+            if len(shape) != 4 or shape[0] != 1 or shape[3] != 128:
+                raise Error(
+                    "MiniMax-H3 adaptive SM120 requires BTHD B=1,D=128"
+                )
+            if shape[2] != 56:
+                raise Error("MiniMax-H3 adaptive SM120 requires H=56")
+            if shape[1] < 4096:
+                raise Error(
+                    "MiniMax-H3 adaptive SM120 requires S>=4096 for H=56"
+                )
+            if comfy_kitchen_attention_current_sm() != 120:
+                raise Error(
+                    "MiniMax-H3 adaptive SM120 requires an sm_120 GPU"
+                )
+            # The accepted policy matches the measured continuation run: CK for
+            # evaluations 0-9, then cU-DNN for late layers 0-1 and P6 for late
+            # layers 2-49.  The pipeline releases CK scratch before allocating
+            # P6, so both large working sets are never resident together.
+            if evg_step < 10:
+                if not comfy_kitchen_scratch:
+                    raise Error(
+                        "MiniMax-H3 adaptive SM120 early policy requires"
+                        " preallocated CK scratch"
+                    )
+                return comfy_kitchen_attention_fwd_scratch(
+                    q, k, v, scale, comfy_kitchen_scratch.value(), ctx
+                )
+            if evg_layer < 2:
+                return sdpa_flash_infer_fwd_dynamic(q, k, v, scale, ctx)
+            if not adaptive_sm120_scratch:
+                raise Error(
+                    "MiniMax-H3 adaptive SM120 requires preallocated scratch"
+                )
+            if adaptive_sink_tokens <= 0:
+                raise Error(
+                    "MiniMax-H3 adaptive SM120 requires explicit sink tokens"
+                )
+            return adaptive_block_attention_sm120_bf16(
+                q, k, v, scale, MINIMAX_H3_ADAPTIVE_SM120_TAU,
+                0, adaptive_sink_tokens,
+                adaptive_sm120_scratch.value(), ctx,
+            )
+        else:
+            raise Error(
+                "MiniMax-H3 adaptive SM120 is not in this binary; rebuild"
+                " with -D H3_ADAPTIVE_SM120=1"
+            )
     if attention_backend == MINIMAX_H3_ATTN_EVG_INT8:
         comptime if MINIMAX_H3_EVG_BUILD_ENABLED:
             if not evg_layout:
@@ -991,6 +1089,10 @@ def _minimax_h3_low_headroom_attention[
     evg_step: Int = 0,
     evg_layer: Int = 0,
     comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
+    adaptive_sm120_scratch: Optional[
+        AdaptiveBlockAttentionTiledScratch
+    ] = None,
+    adaptive_sink_tokens: Int = 0,
 ) raises -> Tensor:
     """Long-sequence attention in a lifetime isolated from the MLP.
 
@@ -1017,7 +1119,7 @@ def _minimax_h3_low_headroom_attention[
     comptime if HeadDim != 128:
         if attention_backend != MINIMAX_H3_ATTN_CUDNN:
             raise Error(
-                "minimax_h3_block_forward: sage-int8 requires head_dim=128"
+                "minimax_h3_block_forward: non-cuDNN attention requires head_dim=128"
             )
     var attn: Tensor
     var attn_scale = Float32(1.0) / (Float32(head_dim) ** Float32(0.5))
@@ -1061,12 +1163,13 @@ def _minimax_h3_low_headroom_attention[
         comptime if HeadDim != 128:
             if attention_backend != MINIMAX_H3_ATTN_CUDNN:
                 raise Error(
-                    "minimax_h3_block_forward: sage-int8 requires head_dim=128"
+                    "minimax_h3_block_forward: non-cuDNN attention requires head_dim=128"
                 )
         attn = _minimax_h3_attention_dispatch(
             split_qkv.q, split_qkv.k, split_qkv.v, attn_scale, ctx,
             attention_backend, sage_scratch, sage_ultravico,
             evg_layout, evg_step, evg_layer, comfy_kitchen_scratch,
+            adaptive_sm120_scratch, adaptive_sink_tokens,
         )
         # Consume Q/K/V before the branch-local owner is destroyed.
         ctx.synchronize()
@@ -1098,12 +1201,13 @@ def _minimax_h3_low_headroom_attention[
         comptime if HeadDim != 128:
             if attention_backend != MINIMAX_H3_ATTN_CUDNN:
                 raise Error(
-                    "minimax_h3_block_forward: sage-int8 requires head_dim=128"
+                    "minimax_h3_block_forward: non-cuDNN attention requires head_dim=128"
                 )
         attn = _minimax_h3_attention_dispatch(
             q4, k4, v4, attn_scale, ctx, attention_backend, sage_scratch,
             sage_ultravico, evg_layout, evg_step, evg_layer,
             comfy_kitchen_scratch,
+            adaptive_sm120_scratch, adaptive_sink_tokens,
         )
         ctx.synchronize()
     var merged = reshape_owned(attn^, [1, S, inner])
@@ -1134,6 +1238,10 @@ def _minimax_h3_block_forward_low_headroom[
     evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
     evg_step: Int = 0,
     comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
+    adaptive_sm120_scratch: Optional[
+        AdaptiveBlockAttentionTiledScratch
+    ] = None,
+    adaptive_sink_tokens: Int = 0,
 ) raises -> Tensor:
     var prefix = minimax_h3_block_prefix(layer)
     var x1 = _minimax_h3_low_headroom_attention[Heads, HeadDim](
@@ -1142,6 +1250,7 @@ def _minimax_h3_block_forward_low_headroom[
         config.attention_head_dim, config.norm_eps, config.qk_norm_eps,
         cos, sin, rotary_dim, ctx, attention_backend, sage_scratch,
         sage_ultravico, evg_layout, evg_step, layer, comfy_kitchen_scratch,
+        adaptive_sm120_scratch, adaptive_sink_tokens,
     )
     # The attention helper's local QKV/rope/SDPA tensors are destroyed only
     # after it returns. Trim here—not inside that helper—so their pool pages
@@ -1257,6 +1366,10 @@ def _minimax_h3_block_forward_impl[
     evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
     evg_step: Int = 0,
     comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
+    adaptive_sm120_scratch: Optional[
+        AdaptiveBlockAttentionTiledScratch
+    ] = None,
+    adaptive_sink_tokens: Int = 0,
 ) raises -> Tensor:
     """One `MiniMaxH3TransformerBlock`. Mirrors `models/minimax_h3/
     block_forward.mojo::_transformer_block` op-for-op (see that file for the
@@ -1358,6 +1471,7 @@ def _minimax_h3_block_forward_impl[
             x, weights, layer, config, mod, adaln_indices, cos, sin,
             rotary_dim, ctx, attention_backend, sage_scratch, sage_ultravico,
             evg_layout, evg_step, comfy_kitchen_scratch,
+            adaptive_sm120_scratch, adaptive_sink_tokens,
         )
     var shift_msa: Tensor
     var scale_msa: Tensor
@@ -1448,6 +1562,7 @@ def _minimax_h3_block_forward_impl[
             split_qkv.q, split_qkv.k, split_qkv.v,
             scale, ctx, attention_backend, sage_scratch, sage_ultravico,
             evg_layout, evg_step, layer, comfy_kitchen_scratch,
+            adaptive_sm120_scratch, adaptive_sink_tokens,
         )
         # The split owner is branch-local.  Finish its final consumer before
         # its three buffers are returned to the stream-ordered allocator.
@@ -1475,6 +1590,7 @@ def _minimax_h3_block_forward_impl[
             q4, k4, v4, scale, ctx, attention_backend, sage_scratch,
             sage_ultravico, evg_layout, evg_step, layer,
             comfy_kitchen_scratch,
+            adaptive_sm120_scratch, adaptive_sink_tokens,
         )
         ctx.synchronize()
                                                                         # [1, S, heads, head_dim] bf16
@@ -1537,6 +1653,10 @@ def minimax_h3_block_forward[
     evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
     evg_step: Int = 0,
     comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
+    adaptive_sm120_scratch: Optional[
+        AdaptiveBlockAttentionTiledScratch
+    ] = None,
+    adaptive_sink_tokens: Int = 0,
 ) raises -> Tensor:
     """Static-S compatibility surface for parity gates and existing callers."""
     var x_shape = x.shape()
@@ -1546,6 +1666,7 @@ def minimax_h3_block_forward[
         x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
         ctx, attention_backend, sage_scratch, sage_ultravico, lora_overlay,
         evg_layout, evg_step, comfy_kitchen_scratch,
+        adaptive_sm120_scratch, adaptive_sink_tokens,
     )
 
 
@@ -1569,10 +1690,15 @@ def minimax_h3_block_forward_dynamic[
     evg_layout: Optional[ArcPointer[EVGH3RaggedLayout]] = None,
     evg_step: Int = 0,
     comfy_kitchen_scratch: Optional[ComfyKitchenAttentionScratch] = None,
+    adaptive_sm120_scratch: Optional[
+        AdaptiveBlockAttentionTiledScratch
+    ] = None,
+    adaptive_sink_tokens: Int = 0,
 ) raises -> Tensor:
     """Runtime-S product surface used by arbitrary H3 canvas geometry."""
     return _minimax_h3_block_forward_impl[Heads, HeadDim](
         x, weights, layer, config, mod, adaln_indices, cos, sin, rotary_dim,
         ctx, attention_backend, sage_scratch, sage_ultravico, lora_overlay,
         evg_layout, evg_step, comfy_kitchen_scratch,
+        adaptive_sm120_scratch, adaptive_sink_tokens,
     )

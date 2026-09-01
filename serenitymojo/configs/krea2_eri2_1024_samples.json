@@ -1,0 +1,30 @@
+{
+ "schema": "serenity.sample_prompts.v1",
+ "_note": "krea2 eri2 1024px inline-sample prompts. Same single prompt as krea2_samples.json; the only deltas are the caps bin paths, which pointed into the deleted /home/alex/eri2_stage_512 (a missing caps bin makes _krea2_inline_cond_from_bin raise mid-run). Regenerate the bins with output/bin/krea2_encode_cli '<prompt>' '' <pos_out> <neg_out>.",
+ "defaults": {
+  "sample_every": 500,
+  "sample_at_start": true,
+  "save_before_sample": false,
+  "precache_required": false,
+  "enforce_min_image_size": false,
+  "width": 1024,
+  "height": 1024,
+  "frames": 1,
+  "fps": 24,
+  "steps": 30,
+  "cfg": 3.5,
+  "seed": 42,
+  "negative": ""
+ },
+ "prompts": [
+  {
+   "id": "vrtlEri2_garden",
+   "prompt": "vrtlEri2 woman in sunlit garden",
+   "seed": 42,
+   "caps": {
+    "positive": "/home/alex/trainings/krea2_eri2_stage_1024/incond_pos.bin",
+    "negative": "/home/alex/trainings/krea2_eri2_stage_1024/incond_neg.bin"
+   }
+  }
+ ]
+}

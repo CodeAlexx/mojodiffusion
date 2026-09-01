@@ -3407,12 +3407,16 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   `scripts/build_h3_ck_attention.sh` pins Comfy Kitchen v0.2.31 commit
   `7c6ca3a5b63857d42c2d49777d6afb69de23f13f` (Apache-2.0) and builds only
   Q/K quantization, V quantization, and Sage attention for one explicit CUDA
-  architecture. The current measured artifact is the 6.7-MiB
+  architecture. The builder discovers the installed CUDA toolkit (or honors
+  `SERENITY_CK_NVCC`), applies the CUDA-12.4 V-quant compatibility shim only
+  for toolkits older than CUDA 12.8, and uses release-mode CUDA headers. The
+  measured SM86 artifact is the 6.7-MiB
   `output/lib/ck/sm86/libserenity_ck_attention.so`; it has no Python dependency and avoids the
   full extension's roughly 15-second first-process operator-registration cost.
-  The CUDA-12.4 compatibility header supplies the same 128-bit BF16 load used
-  upstream behind a newer-toolkit guard; the Mojo output is bit-identical to
-  the official full extension at the gated shapes.
+  On CUDA 12.4 the compatibility header supplies the same 128-bit BF16 load
+  used upstream behind a newer-toolkit guard; newer toolkits use upstream's
+  native definition. The Mojo output is bit-identical to the official full
+  extension at the gated shapes.
 
   `ops/tests/comfy_kitchen_attention_gate.mojo` uses alternating measurement
   order, three warmups, eight iterations per order, exact cU-DNN comparison,
@@ -3424,6 +3428,14 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   0 mismatches, and 87.556 ms versus 147.610 ms PV8 (1.686x), with paired
   CK/cU-DNN means of 87.910/190.887 ms (2.171x). Scratch is allocated once per run:
   651.9 MiB and 729.6 MiB at those respective shapes.
+
+  On the RTX 5080 / SM120 with CUDA 13.1, the same gate builds an 8.7-MiB
+  exact-SM DSO and passes at both real H3 shapes. S=19,029 measured cosine
+  0.999860084, zero repeat-bit mismatches, and 36.898 ms versus 70.918 ms for
+  PV8 (1.922x); S=21,291 measured cosine 0.999859975, zero mismatches, and
+  46.280 ms versus 87.188 ms PV8 (1.884x). The paired exact cU-DNN comparisons
+  were 36.753/96.307 ms (2.620x) and 46.184/120.459 ms (2.608x). This is an
+  attention-kernel acceptance gate, not a decoded SM120 product-video gate.
 
   `--attention-backend=ck-int8` is wired through T2VA, I2VA/L2VA/FL2VA,
   Ref2VA, the Rust request boundary, Generate, Canvas, and H3 Studio. CK
@@ -3477,6 +3489,26 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   builds 50%-density protected/grouped routes in 1.555/2.176 ms, 2.40%/2.64%
   of dense CK, with deterministic routes and bit-unchanged dense output. It is
   routing feasibility only; no sparse attention executor or speedup exists yet.
+- **2026-08-31 SM120 SOL tau-1.5 candidate:**
+  `ops/adaptive_block_attention_{bf16,tiled_bf16,sm120_bf16}.mojo` implements
+  the Serenity-owned block-adaptive BF16 foundation, route-slab-free tiled
+  executor, and isolated SM120 tensor-core kernel. The H3 integration is
+  compile-time dark and accepts only
+  `--attention-backend=adaptive-sm120-sol-tau150` with W8A8 host-RAM weights,
+  zero resident DiT blocks, exact step cache, all 50 blocks, SM120, and tau
+  1.5. It runs CK for evaluations 0-9, then exact cU-DNN for layers 0-1 and
+  SOL for layers 2-49; CK scratch is released before SOL scratch allocation.
+  The ordinary product default remains unchanged.
+  At the real continuation shape S=90,808/H=56/D=128 on RTX 5080, the
+  parser-bound evaluation measured 52.476 seconds. Matched late evaluations
+  11-19 measured 420.536 seconds versus 452.471 for CK, a 7.058% reduction;
+  peak GPU allocation was 13,073 MiB with zero swap and zero timed filesystem
+  input. One-evaluation cosine versus CK was 0.99999648 video / 0.99998660
+  audio; full-final cosine was 0.98767912 / 0.98230977, so this remains an
+  opt-in approximate research backend rather than a quality-default claim.
+  The checked-in fixture and operator gates cover dispatch identity,
+  determinism, fail-loud geometry/configuration, dense equivalence, odd tails,
+  multi-batch routing, and S=4,096/16,384 performance.
 - **2026-08-12 decode-failure retention:** H3 job cleanup deleted
   `latents.safetensors` on EVERY failure, so a transient decode failure
   destroyed the whole denoise (video-0190 lost a 3,434-s 1344x768x243 render;
@@ -3487,8 +3519,12 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   decode/decode_start/result (`cleanup_minimax_h3_intermediates(dir,
   keep_latents)`), making decode failures retryable via the same runner's
   `decode_only` mode instead of unrecoverable (MJ-1129).
-- **Serenity integration:** `MiniMax-H3-Mojo` is an installed video model with one
-  `minimax_h3_serenity_runtime` T2VA executable. Requests independently select
+- **Serenity integration:** Serenity publishes the two installed learned H3
+  checkpoint families as separate product identities: `MiniMax-H3-Mojo`
+  (`MiniMax-H3 Base / FL2VA`) and `MiniMax-H3-Ref2VA-Mojo`
+  (`MiniMax-H3 References / Ref2VA`). The Base card keeps
+  `minimax_h3_serenity_runtime` as its T2VA executable; conditioned tasks use
+  the existing task-specific Mojo runners. Requests independently select
   authored duration from 1 through the trained 15-second ceiling, delivery FPS
   from 1 through 120, and either one of six tested H3-Base canvases or a custom
   width/height
@@ -3512,13 +3548,13 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   cU-DNN-vs-CK on every profile and Sage on the INT8 profiles. H3 owns a separate precision state so BF16 selected on a
   different video model cannot leak into H3; first entry defaults to
   `int8-fast`, while an explicit H3 Quality/BF16 choice remains switchable.
-  Canvas presents this as one H3 generator rather than six backend task modes:
-  no media infers text-to-video, a start image infers I2VA, an end image infers
-  L2VA, both keyframes infer FL2VA, and an ordered media list infers Ref2VA.
-  Generate uses the same source picker and now serializes a selected upload as
-  both `task=i2va` and the exact `source_image` server path; an empty picker
-  emits explicit T2VA and no source field. The focused browser gate proves both
-  request bodies. Result metadata lives in the right-side Current Batch panel,
+  Canvas and H3 Studio keep task inference rather than exposing six backend
+  task cards: no media infers text-to-video, a start image infers I2VA, an end
+  image infers L2VA, both keyframes infer FL2VA, and an ordered media list
+  infers Ref2VA. Generate exposes two checkpoint-family cards instead: Base
+  serializes an empty picker as T2VA or a selected upload as I2VA with the exact
+  `source_image` server path; References serializes that upload as Ref2VA. The
+  focused browser gate proves all three request bodies. Result metadata lives in the right-side Current Batch panel,
   never as an overlay over the generated image or video.
   Resolution, Seconds, FPS, and Quality remain common controls; attention and
   cache policy are collapsed under Advanced performance. `Continue H3` is an

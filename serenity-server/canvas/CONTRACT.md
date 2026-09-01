@@ -165,6 +165,12 @@ compatibility unless a separately reviewed contract migration changes them.
 
 ## H3 Studio behavior
 
+- Generate and Models expose two truthful MiniMax H3 checkpoint-family cards.
+  `MiniMax-H3 Base / FL2VA` maps an empty source to T2VA and one source image to
+  I2VA. `MiniMax-H3 References / Ref2VA` selects the separately learned Ref2VA
+  checkpoint and requires a visual reference. The stable machine identities
+  remain `MiniMax-H3-Mojo` and `MiniMax-H3-Ref2VA-Mojo`; display titles are not
+  submitted as model identities.
 - H3 Studio is the project-based MiniMax H3 filmmaker mounted at
   `/?tab=h3-studio`. Project state uses schema `serenity.h3.movie.v1` and
   browser localStorage key `serenity-h3-current-project-v1`; there is no

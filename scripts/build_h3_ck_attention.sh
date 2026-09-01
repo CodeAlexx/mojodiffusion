@@ -13,7 +13,17 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 tag=v0.2.31
 commit=7c6ca3a5b63857d42c2d49777d6afb69de23f13f
 vendor="$repo_root/output/vendor/comfy-kitchen-$tag"
-nvcc=${SERENITY_CK_NVCC:-/usr/local/cuda-12.4/bin/nvcc}
+nvcc=${SERENITY_CK_NVCC:-}
+if [[ -z "$nvcc" ]]; then
+  if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+    nvcc=/usr/local/cuda/bin/nvcc
+  elif command -v nvcc >/dev/null 2>&1; then
+    nvcc=$(command -v nvcc)
+  else
+    echo "nvcc is unavailable; set SERENITY_CK_NVCC explicitly" >&2
+    exit 2
+  fi
+fi
 
 raw_arch=${SERENITY_CK_CUDA_ARCH:-}
 if [[ -z "$raw_arch" ]]; then
@@ -60,6 +70,21 @@ if ! "$nvcc" --list-gpu-code | grep -qx "sm_$arch"; then
   exit 2
 fi
 
+nvcc_release=$("$nvcc" --version \
+  | sed -n 's/.*release \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p' \
+  | head -n 1)
+if [[ -z "$nvcc_release" ]]; then
+  echo "could not determine CUDA toolkit version from $nvcc" >&2
+  exit 2
+fi
+read -r cuda_major cuda_minor <<<"$nvcc_release"
+quant_v_compat=()
+if (( cuda_major < 12 || (cuda_major == 12 && cuda_minor < 8) )); then
+  quant_v_compat=(
+    -include "$repo_root/serenitymojo/ops/cshim/comfy_kitchen_cuda124_compat.cuh"
+  )
+fi
+
 build="$repo_root/output/lib/ck_minimal_build/sm$arch"
 output=${SERENITY_CK_OUTPUT:-"$repo_root/output/lib/ck/sm$arch/libserenity_ck_attention.so"}
 
@@ -68,7 +93,7 @@ sage_src="$cuda_src/sage_attention"
 mkdir -p "$build" "$(dirname "$output")"
 common=(
   -I "$cuda_src" -I "$sage_src"
-  -std=c++17 -O3 --use_fast_math
+  -std=c++17 -O3 -DNDEBUG --use_fast_math
   --expt-relaxed-constexpr --expt-extended-lambda
   -U__CUDA_NO_HALF_OPERATORS__ -U__CUDA_NO_HALF_CONVERSIONS__
   -U__CUDA_NO_BFLOAT16_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__
@@ -79,7 +104,7 @@ common=(
 "$nvcc" -c "$sage_src/quant_qk_int8.cu" \
   -o "$build/quant_qk_int8.o" "${common[@]}"
 "$nvcc" -c "$sage_src/quant_v_int8.cu" \
-  -include "$repo_root/serenitymojo/ops/cshim/comfy_kitchen_cuda124_compat.cuh" \
+  "${quant_v_compat[@]}" \
   -o "$build/quant_v_int8.o" "${common[@]}"
 "$nvcc" -c "$sage_src/sage_attn_launcher.cu" \
   -o "$build/sage_attn_launcher.o" "${common[@]}"

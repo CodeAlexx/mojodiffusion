@@ -303,13 +303,30 @@ def minimax_h3_video_tiled_decode[
                     " unsupported here"
                 )
             stacked.append(TArc(slice(row_slice, 3, j_pos, j_len, ctx)))
-    var batch = stacked[0][].clone(ctx)
-    for t in range(1, len(stacked)):
-        batch = concat(0, ctx, batch, stacked[t][])
-    var decoded = minimax_h3_video_decode_device_batched(decoder, batch, ctx)
     var raw = List[TArc]()
-    for _ in range(len(decoded)):
-        raw.append(TArc(decoded.pop(0)))
+    # A 1344x768 frame produces 28 released-size spatial tiles.  Decoding all
+    # of them as one batch is fast on a 24 GiB card, but its activation peak
+    # cannot coexist with the released 9.8 GiB VAE on a 16 GiB card.  Preserve
+    # exact tile math and stitching while bounding the live activation set to
+    # one tile.  Small grids retain the measured batched fast path.
+    if len(stacked) > 8:
+        for t in range(len(stacked)):
+            var decoded_tile = minimax_h3_video_decode_device[
+                S_TILE, HEADS, DIM_HEAD
+            ](decoder, stacked[t][], ctx)
+            # Complete this tile before the next decoder call so its internal
+            # attention/MLP temporaries cannot overlap the next tile's peak.
+            ctx.synchronize()
+            raw.append(TArc(decoded_tile^))
+    else:
+        var batch = stacked[0][].clone(ctx)
+        for t in range(1, len(stacked)):
+            batch = concat(0, ctx, batch, stacked[t][])
+        var decoded = minimax_h3_video_decode_device_batched(
+            decoder, batch, ctx
+        )
+        for _ in range(len(decoded)):
+            raw.append(TArc(decoded.pop(0)))
 
     var result_rows = List[TArc]()
     for i in range(i_max):

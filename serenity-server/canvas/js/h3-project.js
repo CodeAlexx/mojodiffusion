@@ -213,7 +213,7 @@ var H3ProjectContracts = (function () {
         out.continuation_direction = String(out.continuation_direction || '');
         out.fingerprint = String(out.fingerprint || '');
         out.error = String(out.error || '');
-        if (out.active_job && ['submitting', 'running', 'stopping'].indexOf(out.status) < 0) {
+        if (out.active_job && ['submitting', 'running', 'stopping', 'failed'].indexOf(out.status) < 0) {
             out.status = 'failed'; out.error = 'Imported endless run has an active job in a terminal state.'; out.active_job = null;
         }
         if (['idle', 'failed'].indexOf(out.status) < 0 && (!out.base_snapshot || !out.segment_output_frames.length)) {

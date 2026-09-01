@@ -10,9 +10,10 @@ fixture_sha="${fixture_dir}/minimax_h3_training_block_bf16_flash.sha256"
 oracle="${script_dir}/minimax_h3_training_block_bf16_flash_oracle.py"
 gate="${script_dir}/minimax_h3_training_block_bf16_flash_parity.mojo"
 binary="/tmp/minimax_h3_training_block_bf16_flash_parity"
+oracle_python="${H3_TORCH_ORACLE_PYTHON:-python3}"
 
 cd "${repo_root}"
-/home/alex/OneTrainer/venv/bin/python "${oracle}" --check
+"${oracle_python}" "${oracle}" --check
 (
     cd "${fixture_dir}"
     sha256sum -c minimax_h3_training_block_bf16_flash.sha256

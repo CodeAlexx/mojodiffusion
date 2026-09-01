@@ -168,6 +168,7 @@ var ModelsTab = (function () {
                 seen['model:' + model.name] = true;
                 allModels.push({
                     name: model.name,
+                    displayName: model.card && model.card.title || model.name,
                     path: model.path || model.name,
                     type: model.format === 'full_checkpoint' ? 'checkpoint' : 'unet',
                     arch: model.arch || ModelUtils.archForModel(model.name),
@@ -344,7 +345,8 @@ var ModelsTab = (function () {
     }
     function applyFilters() {
         filteredModels = allModels.filter(function (m) {
-            if (filters.search && m.name.toLowerCase().indexOf(filters.search) === -1)
+            if (filters.search && m.name.toLowerCase().indexOf(filters.search) === -1 &&
+                String(m.displayName || '').toLowerCase().indexOf(filters.search) === -1)
                 return false;
             if (filters.type === 'checkpoint') {
                 if (m.type !== 'checkpoint' && m.type !== 'unet')
@@ -393,7 +395,7 @@ var ModelsTab = (function () {
                     '<div class="model-card-badge" style="background:' + color + '">' + m.arch.toUpperCase() + '</div>' +
                     '</div>' +
                     '<div class="model-card-type">' + m.type + '</div>' +
-                    '<div class="model-card-name" title="' + escapeHtml(m.name) + '">' + escapeHtml(m.name) + '</div>' +
+                    '<div class="model-card-name" data-name="' + escapeHtml(m.name) + '" title="' + escapeHtml(m.displayName || m.name) + '">' + escapeHtml(m.displayName || m.name) + '</div>' +
                     '<div class="model-card-size">' + sizeLabel + '</div>' +
                     useButton;
             grid.appendChild(card);
@@ -425,7 +427,7 @@ var ModelsTab = (function () {
             if (clickedCard) {
                 var nameEl = clickedCard.querySelector('.model-card-name');
                 if (nameEl) {
-                    var modelName = nameEl.getAttribute('title');
+                    var modelName = nameEl.dataset.name || nameEl.getAttribute('title');
                     var model = findModelByName(modelName);
                     if (model)
                         showDetailPanel(model);

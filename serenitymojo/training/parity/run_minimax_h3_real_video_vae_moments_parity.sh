@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 musubi_repo="${MUSUBI_REPO:-$(dirname "$repo")/musubi-tuner}"
-python_bin="${H3_ORACLE_PYTHON:-$(dirname "$repo")/OneTrainer/venv/bin/python}"
+python_bin="${H3_ORACLE_PYTHON:-${H3_TORCH_ORACLE_PYTHON:-python3}}"
 dataset="${H3_REAL_DATASET:-$(dirname "$repo")/eri2_with_trigger}"
 vae_file="${H3_VIDEO_VAE_FILE:-$(dirname "$repo")/SwarmUI/Models/VAE/MiniMaxH3/minimax_h3_video_vae_fp16.safetensors}"
 vae_dir="${H3_VIDEO_VAE_DIR:-$(dirname "$repo")/SerenityFlow/serenityflow/models/minimax_h3/vae/video/source}"

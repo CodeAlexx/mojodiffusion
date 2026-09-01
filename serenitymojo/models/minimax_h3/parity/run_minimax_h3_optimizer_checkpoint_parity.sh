@@ -11,7 +11,7 @@ fixture_sha="${fixture_dir}/minimax_h3_optimizer_checkpoint_v1.sha256"
 oracle="${script_dir}/minimax_h3_optimizer_checkpoint_oracle.py"
 gate="${script_dir}/minimax_h3_optimizer_checkpoint_parity.mojo"
 binary="/tmp/minimax_h3_inventory_reduced_optimizer_private_state_gate"
-one_trainer_python="${H3_ONETRAINER_ORACLE_PYTHON:-${repo_root}/../OneTrainer/venv/bin/python}"
+torch_oracle_python="${H3_TORCH_ORACLE_PYTHON:-python3}"
 ltx_python="${H3_LTX_ORACLE_PYTHON:-${repo_root}/../LTX-2/.venv/bin/python}"
 target_accelerator="${H3_TARGET_ACCELERATOR:-}"
 
@@ -24,7 +24,7 @@ if [[ -z "${target_accelerator}" ]]; then
     target_accelerator="sm_${compute_cap}"
 fi
 
-for oracle_python in "${one_trainer_python}" "${ltx_python}"; do
+for oracle_python in "${torch_oracle_python}" "${ltx_python}"; do
     if [[ ! -x "${oracle_python}" ]]; then
         echo "Missing required oracle Python: ${oracle_python}" >&2
         exit 1
@@ -35,7 +35,7 @@ cd "${repo_root}"
 
 # Both supported development environments must independently regenerate the
 # same canonical bytes before compilation is allowed to start.
-"${one_trainer_python}" "${oracle}" --check
+"${torch_oracle_python}" "${oracle}" --check
 "${ltx_python}" "${oracle}" --check
 (
     cd "${fixture_dir}"

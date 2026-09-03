@@ -68,6 +68,15 @@ MODELS = {
         "group": re.compile(r"^((?:double_blocks|single_blocks)\.\d+)\."),
         "exclude": re.compile(r"(_mod\.|modulation|adaln|norm)", re.IGNORECASE),
     },
+    # FLUX.2 [dev] 32B: same double/single block key layout (8 double + 48
+    # single blocks, hidden 6144, qkv 18432, mlp 36864 packed); 167 eligible
+    # linears, 64.4 GB bf16, every `in` % 256 == 0. Verified from the
+    # checkpoint header 2026-09-03.
+    "flux2dev": {
+        "include": re.compile(r"^(double_blocks|single_blocks)\.\d+\..*\.weight$"),
+        "group": re.compile(r"^((?:double_blocks|single_blocks)\.\d+)\."),
+        "exclude": re.compile(r"(_mod\.|modulation|adaln|norm)", re.IGNORECASE),
+    },
     "krea2": {
         "include": re.compile(r"^blocks\.\d+\..*\.weight$"),
         "group": re.compile(r"^(blocks\.\d+)\."),

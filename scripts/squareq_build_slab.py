@@ -61,6 +61,13 @@ MODELS = {
         "group": re.compile(r"^((?:double_blocks|single_blocks)\.\d+)\."),
         "exclude": re.compile(r"(_mod\.|modulation|adaln|norm)", re.IGNORECASE),
     },
+    # FLUX.2 [klein] 9B: same double/single block key layout as 4B (112 eligible
+    # linears, 17.4 GB bf16; every eligible `in` is 4096 or 12288, % 256 == 0).
+    "klein9b": {
+        "include": re.compile(r"^(double_blocks|single_blocks)\.\d+\..*\.weight$"),
+        "group": re.compile(r"^((?:double_blocks|single_blocks)\.\d+)\."),
+        "exclude": re.compile(r"(_mod\.|modulation|adaln|norm)", re.IGNORECASE),
+    },
     "krea2": {
         "include": re.compile(r"^blocks\.\d+\..*\.weight$"),
         "group": re.compile(r"^(blocks\.\d+)\."),

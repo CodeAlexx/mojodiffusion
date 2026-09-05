@@ -114,7 +114,8 @@ file is "where does X live". First target: Z-Image text→image.
 | `ops/elementwise.mojo` | `modulate` ((1+s)x+sh), `residual_gate` (x+g·y) — DiT AdaLN. | ✅ |
 | `ops/attention.mojo` | `sdpa[B,S,H,Dh]` — flash (Dh==64) + math-mode fallback (any Dh); `sdpa_tiled`/`sdpa_nomask_tiled` — online-softmax (never materializes [S,S]) for LARGE S at Dh∈{64,128} (cosmos full-res, no OOM; cos=1.0 vs math-mode). | ✅ |
 | `ops/comfy_kitchen_attention.mojo` + `ops/cshim/comfy_kitchen_attention.cpp` | H3 BF16-QKV to Comfy Kitchen INT8-QK/INT8-PV Sage launcher bridge with run-lifetime scratch, current MAX CUDA-stream handoff, and zero steady-state device allocations. `scripts/build_h3_ck_attention.sh` produces an exact-SM architecture-tagged launcher DSO from pinned v0.2.31 source; no Python runtime dependency. | ✅ SM86 H3 S=19,029/21,291 cosine 0.999860, repeat-bit mismatches 0, 68.36/87.91 ms in the paired cU-DNN gate |
-| `ops/conv.mojo` | `conv2d[...]` (NHWC/RSCF, SDK naive kernel + bias add). | ✅ |
+| `ops/conv.mojo` | `conv2d[...]` (NHWC/RSCF). BF16 goes to cuDNN through `ops/cudnn_conv2d.mojo` behind `comptime CONV2D_CUDNN_NHWC` (default on; the RSCF filter is permuted to KRSC on device); off = the im2col + GEMM reference path. 2026-09-04: the im2col of a 1024x1024 feature map was gigabytes per conv and why three models decoded 1024x1024 in ~11 s. | ✅ |
+| `ops/cudnn_conv2d.mojo` + `ops/cshim/cudnn_conv2d.cpp` | `cudnn_conv2d_bf16_nchw` / `cudnn_conv2d_bf16_nhwc` (`serenity_cudnn_conv2d_bf16_{nchw,nhwc}` in `libserenity_cudnn_sdpa.so`): cuDNN implicit-GEMM conv2d, F32 accumulate, optional bias. SDXL decode 40.45 dB vs im2col. | ✅ |
 | `ops/embeddings.mojo` | `timestep_embedding`, `t_embedder`, `build_rope_tables`. | ✅ |
 | `ops/tensor_algebra.mojo` | `add/sub/mul/div` (+scalar), `reshape`, `permute`, `transpose`, `concat`, `slice`, `gather_rows`. | ✅ |
 | `ops/layout.mojo` | `patchify`, `unpatchify`, `deinterleave_pair`. | ✅ |

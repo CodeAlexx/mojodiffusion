@@ -636,7 +636,7 @@ the creator PyAV preprocessing output.
 The forward kernels the backward partners pair with: `ops/attention.mojo`
 (math-mode SDPA fwd), `ops/linear.mojo`, `ops/norm.mojo`, `ops/activations.mojo`
 (`silu`, `swiglu`), `ops/reduce.mojo`, `ops/rope.mojo`, `ops/conv.mojo`
-(SDK conv2d fwd wrapper), `ops/conv1d.mojo`, `ops/elementwise.mojo`,
+(conv2d fwd: BF16 via cuDNN NHWC in `ops/cudnn_conv2d.mojo` behind `CONV2D_CUDNN_NHWC`, im2col+GEMM reference otherwise), `ops/conv1d.mojo`, `ops/elementwise.mojo`,
 `ops/tensor_algebra.mojo` (transpose/concat/slice/add/mul_scalar/zeros_device/full_device/scalar_f32_device),
 `ops/tensor_algebra_scratch.mojo` (opt-in scratch-backed shape helpers),
 `ops/softmax.mojo`, `ops/cast.mojo`, `ops/embeddings.mojo`, `ops/layout.mojo`,

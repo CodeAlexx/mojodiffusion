@@ -41,6 +41,11 @@ from serenitymojo.ops.tensor_algebra import reshape, transpose
 comptime _DYN1 = Layout.row_major(-1)
 comptime _DYN2 = Layout.row_major(-1, -1)
 comptime _BLOCK = 256
+# BF16 conv2d goes to cuDNN (ops/cudnn_conv2d.mojo, NHWC entry). Off = the
+# im2col + GEMM path below, kept as the numerical reference.
+comptime CONV2D_CUDNN_NHWC = True
+from serenitymojo.ops.cudnn_conv2d import cudnn_conv2d_bf16_nhwc
+from serenitymojo.ops.tensor_algebra import permute
 comptime _CONV_BS = 16  # 2D conv block tile (block_size x block_size)
 
 
@@ -298,6 +303,20 @@ def conv2d[
     # Fast path: im2col + F32-accumulated `linear` gemm (numerically equal to the
     # naive conv, ~50x faster at high resolution). The naive SDK kernel below is
     # kept as reference/fallback.
+    # cuDNN implicit-GEMM conv for BF16 (the production dtype). The filter is
+    # re-laid from the checkpoint's RSCF to cuDNN's KRSC on the device -- a few
+    # million elements at most, negligible next to an im2col of a 1024x1024
+    # feature map, which is gigabytes per convolution and is why three
+    # different models all decoded a 1024x1024 image in ~11 s. Same F32
+    # accumulation as the im2col path, so this agrees to BF16 rounding.
+    # The flag keeps the im2col/naive paths intact as the reference.
+    comptime if CONV2D_CUDNN_NHWC:
+        if x.dtype() == STDtype.BF16 and weight.dtype() == STDtype.BF16:
+            var krsc: List[Int] = [3, 0, 1, 2]
+            var weight_krsc = permute(weight, krsc, ctx)
+            return cudnn_conv2d_bf16_nhwc(
+                x, weight_krsc, bias, stride_h, stride_w, pad_h, pad_w, ctx
+            )
     return conv2d_im2col[
         N, Hi, Wi, Cin, Kh, Kw, Cout, stride_h, stride_w, pad_h, pad_w
     ](x, weight, bias, ctx)

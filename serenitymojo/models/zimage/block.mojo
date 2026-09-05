@@ -74,7 +74,16 @@ from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.activations import swiglu
 from serenitymojo.ops.elementwise import modulate, residual_gate
 from serenitymojo.ops.rope import rope_interleaved
-from serenitymojo.ops.attention import sdpa, sdpa_nomask
+from serenitymojo.ops.attention import sdpa, sdpa_nomask, sdpa_nomask_infer
+# Production inference attention: `sdpa_nomask_infer` routes BF16 q/k/v to the
+# cuDNN flash kernel (ops/attention.mojo:2648, numerics signed off 2026-06-11);
+# `sdpa_nomask` is the math-mode SDPA that materialises the full S x S score
+# matrix -- the SDK flash kernel does not compile for Dh == 128 on sm_86, so
+# every Dh=128 model that calls it pays the math path. lora_block.mojo has used
+# the `_infer` form behind this same flag since the sign-off; the inference
+# block simply never did. Measured on this box before the change: 2.27-3.21
+# s/step at 1024x1024 (output/run_serenity_ui job-0051/0052 manifests).
+comptime ZIMAGE_SDPA_FLASH = True
 from serenitymojo.ops.unary import tanh_op
 from serenitymojo.ops.tensor_algebra import reshape_owned, reshape_in_place, add
 
@@ -296,7 +305,11 @@ def zimage_block_forward[
     var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
     var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
 
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att: Tensor
+    comptime if ZIMAGE_SDPA_FLASH:
+        att = sdpa_nomask_infer[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    else:
+        att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
     var att_flat = reshape_owned(att^, [S, D])
 
     var no_bias_o = Optional[Tensor](None)
@@ -621,7 +634,11 @@ def zimage_refiner_forward[
     var q_rope = rope_interleaved(q_rms, cos, sin, ctx)
     var k_rope = rope_interleaved(k_rms, cos, sin, ctx)
 
-    var att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    var att: Tensor
+    comptime if ZIMAGE_SDPA_FLASH:
+        att = sdpa_nomask_infer[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
+    else:
+        att = sdpa_nomask[1, S, H, Dh](q_rope, k_rope, v, scale, ctx)
     var att_flat = reshape_owned(att^, [S, D])
 
     var no_bias_o = Optional[Tensor](None)

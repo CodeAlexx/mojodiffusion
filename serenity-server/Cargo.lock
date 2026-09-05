@@ -940,6 +940,7 @@ dependencies = [
  "genesis-web",
  "httpdate",
  "image",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

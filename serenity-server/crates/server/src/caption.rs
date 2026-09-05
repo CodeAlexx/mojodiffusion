@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::blocking::CommandDeadline;
 
 const CAPTION_START: &str = "=== CAPTION ===";
 const CAPTION_END: &str = "=== END ===";
@@ -92,7 +93,15 @@ fn validate_image_path(p: &str, out_dir: &Path) -> Result<(), String> {
 ///
 /// `gallery_id` (a `job-XXXX` id) resolves to `<out_dir>/<id>.png`; otherwise
 /// `image_path` (absolute) is used. GPU/one-shot: runs synchronously.
+/// Async entry: the body is pure blocking work (a GPU subprocess held for
+/// seconds to minutes), so it runs on the blocking pool rather than parking a
+/// runtime worker, and a panic inside it answers 500 instead of resetting the
+/// connection. See blocking.rs.
 pub async fn post_caption(State(st): State<AppState>, body: String) -> Response {
+    crate::blocking::offload(move || post_caption_blocking(st, body)).await
+}
+
+fn post_caption_blocking(st: AppState, body: String) -> Response {
     let v: Value = match serde_json::from_str::<Value>(&body) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad json: {e}")),
@@ -169,12 +178,12 @@ pub async fn post_caption(State(st): State<AppState>, body: String) -> Response 
     }
     cmd.env("LD_LIBRARY_PATH", mojo_library_path(&root));
 
-    let out = match cmd.output() {
+    let out = match cmd.output_with_deadline(crate::blocking::subprocess_deadline()) {
         Ok(o) => o,
         Err(e) => {
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("spawn failed: {e}"),
+                &format!("subprocess failed: {e}"),
             );
         }
     };
@@ -208,7 +217,15 @@ pub async fn post_caption(State(st): State<AppState>, body: String) -> Response 
 /// its flag mode: text-only unless `image_path` is given. Used by the H3 Studio
 /// Director pass with the `serenity.h3.caption.v2` system prompt. Same GPU
 /// lease / idle-image-worker eviction as `/v1/caption`; synchronous.
+/// Async entry: the body is pure blocking work (a GPU subprocess held for
+/// seconds to minutes), so it runs on the blocking pool rather than parking a
+/// runtime worker, and a panic inside it answers 500 instead of resetting the
+/// connection. See blocking.rs.
 pub async fn post_h3_director(State(st): State<AppState>, body: String) -> Response {
+    crate::blocking::offload(move || post_h3_director_blocking(st, body)).await
+}
+
+fn post_h3_director_blocking(st: AppState, body: String) -> Response {
     let v: Value = match serde_json::from_str::<Value>(&body) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad json: {e}")),
@@ -273,9 +290,9 @@ pub async fn post_h3_director(State(st): State<AppState>, body: String) -> Respo
     }
     cmd.arg(format!("--max-new={max_new}"));
     cmd.env("LD_LIBRARY_PATH", mojo_library_path(&root));
-    let out = match cmd.output() {
+    let out = match cmd.output_with_deadline(crate::blocking::subprocess_deadline()) {
         Ok(o) => o,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("spawn failed: {e}")),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("subprocess failed: {e}")),
     };
     if !out.status.success() {
         return err(

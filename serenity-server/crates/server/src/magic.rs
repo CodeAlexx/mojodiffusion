@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::blocking::CommandDeadline;
 
 fn repository_root() -> PathBuf {
     crate::repository_root_path()
@@ -90,7 +91,15 @@ fn push_llm(out: &mut Vec<Value>, path: &Path) {
 }
 
 /// POST /v1/magic_prompt {idea, aspect, model} -> {"caption": "<single-line JSON>"}.
+/// Async entry: the body is pure blocking work (a GPU subprocess held for
+/// seconds to minutes), so it runs on the blocking pool rather than parking a
+/// runtime worker, and a panic inside it answers 500 instead of resetting the
+/// connection. See blocking.rs.
 pub async fn post_magic_prompt(State(st): State<AppState>, body: String) -> Response {
+    crate::blocking::offload(move || post_magic_prompt_blocking(st, body)).await
+}
+
+fn post_magic_prompt_blocking(st: AppState, body: String) -> Response {
     let v: Value = match serde_json::from_str::<Value>(&body) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad json: {e}")),
@@ -124,7 +133,7 @@ pub async fn post_magic_prompt(State(st): State<AppState>, body: String) -> Resp
         .arg(&model)
         .arg(&aspect)
         .arg(&idea)
-        .output();
+        .output_with_deadline(crate::blocking::subprocess_deadline());
     match out {
         Ok(o) if o.status.success() => {
             let caption = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -142,7 +151,7 @@ pub async fn post_magic_prompt(State(st): State<AppState>, body: String) -> Resp
         ),
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("spawn failed: {e}"),
+            &format!("subprocess failed: {e}"),
         ),
     }
 }
@@ -168,8 +177,8 @@ fn run_mojo_magic(idea: &str, aspect: &str) -> Result<String, String> {
         .arg(idea)
         .arg(aspect)
         .env("LD_LIBRARY_PATH", mojo_library_path(&root))
-        .output()
-        .map_err(|e| format!("spawn failed: {e}"))?;
+        .output_with_deadline(crate::blocking::subprocess_deadline())
+        .map_err(|e| format!("subprocess failed: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "mojo magic failed: {}",
@@ -201,7 +210,15 @@ fn run_mojo_magic(idea: &str, aspect: &str) -> Result<String, String> {
 /// Simple-mode Enhance button (simple.js). Backend = the pure-Mojo magic
 /// prompt (structured-JSON caption — ideogram-schema; other arch templates
 /// later). Falls back to a clear error the frontend's local enhancer handles.
+/// Async entry: the body is pure blocking work (a GPU subprocess held for
+/// seconds to minutes), so it runs on the blocking pool rather than parking a
+/// runtime worker, and a panic inside it answers 500 instead of resetting the
+/// connection. See blocking.rs.
 pub async fn post_enhance_prompt(State(st): State<AppState>, body: String) -> Response {
+    crate::blocking::offload(move || post_enhance_prompt_blocking(st, body)).await
+}
+
+fn post_enhance_prompt_blocking(st: AppState, body: String) -> Response {
     let v: Value = match serde_json::from_str::<Value>(&body) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad json: {e}")),

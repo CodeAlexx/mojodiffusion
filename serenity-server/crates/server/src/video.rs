@@ -1114,7 +1114,15 @@ pub async fn get_video() -> Response {
 
 /// POST /v1/video — dispatch to the selected model-specific orchestration
 /// module after normalizing the small set of shared request fields.
+/// Async entry: the body is pure blocking work (a GPU subprocess held for
+/// seconds to minutes), so it runs on the blocking pool rather than parking a
+/// runtime worker, and a panic inside it answers 500 instead of resetting the
+/// connection. See blocking.rs.
 pub async fn post_video(State(st): State<AppState>, body: String) -> Response {
+    crate::blocking::offload(move || post_video_blocking(st, body)).await
+}
+
+fn post_video_blocking(st: AppState, body: String) -> Response {
     let mut b: Value = serde_json::from_str::<Value>(&body)
         .ok()
         .filter(|v| v.is_object())

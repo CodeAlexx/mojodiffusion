@@ -59,11 +59,15 @@ pub(crate) struct GpuGuard {
 
 impl Drop for GpuGuard {
     fn drop(&mut self) {
-        if let Ok(mut o) = self.owner.lock() {
-            let ours = o.as_ref().map(|l| l.id == self.id).unwrap_or(false);
-            if ours {
-                *o = None;
-            }
+        // Release even through poison: a lease that is never dropped because
+        // the mutex was poisoned is a GPU nobody can use until restart.
+        let mut o = match self.owner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let ours = o.as_ref().map(|l| l.id == self.id).unwrap_or(false);
+        if ours {
+            *o = None;
         }
     }
 }
@@ -75,7 +79,11 @@ pub(crate) fn try_acquire(
     kind: &'static str,
     id: &str,
 ) -> Result<GpuGuard, GpuLease> {
-    let mut o = owner.lock().expect("gpu_owner mutex poisoned");
+    // A poisoned mutex means some thread panicked while holding it. The state
+    // inside is a plain Option that is always consistent, so recover it: the
+    // alternative was every later request panicking here too, which turned one
+    // failure into "everything 500s until restart".
+    let mut o = owner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(cur) = o.as_ref() {
         return Err(cur.clone());
     }

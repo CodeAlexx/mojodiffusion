@@ -22,4 +22,5 @@ tracing-subscriber.workspace = true
 image.workspace = true
 rusqlite.workspace = true
 httpdate.workspace = true
+libc.workspace = true
 genesis-web = { path = "../../../vendor/genesis/web" }

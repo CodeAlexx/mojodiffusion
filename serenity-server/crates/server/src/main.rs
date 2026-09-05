@@ -58,6 +58,7 @@ use serenity_graph::lower_request;
 use serenity_ipc::{EventPoll, WorkerHandle, spawn_worker};
 use serenity_wire::{JobParams, LoraSpec, WorkerEvent};
 
+mod blocking;
 mod block_profiles;
 mod capabilities;
 mod caption;
@@ -5683,6 +5684,29 @@ mod endpoint_tests {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+    // Every panic -- a handler, the worker-driver thread, a spawned task --
+    // lands in the log with its location before the default hook prints it.
+    // Without this a background-thread panic was a silent vanishing: the
+    // thread died, the log said nothing, and the symptom was "the server
+    // stopped doing things" with nothing to read afterwards.
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_default();
+            let message = info
+                .payload()
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| info.payload().downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            let thread = std::thread::current();
+            tracing::error!(%location, %message, thread = thread.name().unwrap_or("?"), "PANIC");
+            default_hook(info);
+        }));
+    }
 
     // 1. CLI.
     let cli = parse_args();

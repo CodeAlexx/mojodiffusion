@@ -8,6 +8,7 @@
 *.md
 !README.md
 !serenity-server/README.md
+!docs/MINIMAX_H3_PORT_MAP.md
 !docs/MOJO_AUTOGRAD_INTERNALS.md
 !docs/MOJO_CONVENTIONS.md
 !docs/MOJO_DIAGNOSTICS.md

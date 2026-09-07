@@ -714,11 +714,17 @@ var H3ProjectContracts = (function () {
 
     function compilePrompt(shot, project) {
         var refs = effectiveReferences(shot, project);
-        var hasCast = Object.keys(castPathSet(project)).length > 0;
-        // Honour an explicit override, EXCEPT when a cast must be enforced on an
-        // unlocked shot (that override is the drift source we are fixing). A locked
-        // shot always keeps its exact prompt.
-        if (String(shot.prompt_override || '').trim() && (!hasCast || shot.locked === true)) return shot.prompt_override;
+        // An explicit override is the author's own words and always wins. A
+        // previous version of this discarded the override whenever the project
+        // had any cast member, on the theory that the override was the identity
+        // drift being fixed. That silently rewrote authored prompts: adding one
+        // cast member replaced every unlocked shot's prompt with a compiled
+        // Ref2VA contract and attached the cast reference to shots that had
+        // none, so a shot rendered as a different scene than its author wrote.
+        // Cast identity is enforced through the references the request carries,
+        // not by destroying authored text; a shot whose prompt should follow the
+        // cast simply has no override.
+        if (String(shot.prompt_override || '').trim()) return shot.prompt_override;
         var mode = detectMode(shot, project);
         var plan = planText(shot);
         var sound = String(shot.soundscape || '').trim() || 'N/A';

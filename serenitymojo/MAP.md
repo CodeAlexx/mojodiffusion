@@ -3210,6 +3210,27 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   timestep alone); inner 7168 != hidden 5376; qkv de-interleave + fc1
   [gate;value] swap owned by the LOADER; final-layer modulate runs in BF16
   with the F32 cast AFTER (transformer_minimax_h3.py:638).
+- `models/dit/minimax_h3_controlnet.mojo` + `pipeline/minimax_h3_control_media.mojo`
+  — MiniMax-H3-Fun-Controlnet-Union: a five-block side transformer whose
+  residual is added AFTER base blocks 0/10/20/30/40, with audio rows zeroed and
+  text/video rows live. Guarded to contiguous T2VA (the released ControlNet
+  supports that layout only). Guide packing is
+  [control 24ch | visibility 1ch | masked source 24ch] = 49 channels -> patchify
+  (1,2,2) -> 196 features, control-only media zero-filling channels 24..48;
+  the video VAE encode uses the POSTERIOR MEAN, not a sample.
+  WEIGHT-LAYOUT LAW (measured on the real checkpoints, do not "fix" it again):
+  the released Union checkpoint is in the DIFFUSERS order, so
+  * `attn.to_{q,k,v}` concatenated on dim 0 IS the native contiguous [Q;K;V]
+    ABI — the base loader's de-interleave must NOT be applied (control head 0
+    matches base fused head-0 slots at cos 0.9996/0.9997/0.9998), and
+  * `ff.net.0.proj` is already [value; gate], the same order the native ABI
+    wants, so the base loader's fc1 half-swap must NOT be applied either.
+    `control_blocks.0.ff.net.0.proj` matches `blocks.0.mlp.fc1` only ACROSS
+    halves (cos 0.9995 crossed, -0.006 uncrossed); swapping it exchanges the
+    SwiGLU gate and value halves in all five side blocks, which no shape,
+    census, or residual check can see.
+  Product reference for the runtime semantics:
+  `serenityflow/serenityflow/models/minimax_h3/control.py`.
 - `models/dit/minimax_h3_qk_inplace.mojo` plus the chunked/fused paths in
   `minimax_h3_{dit,frontend,int8_linear}.mojo` bound long-sequence temporary
   storage: one kernel performs each owned Q/K tensor's RMS normalization,
@@ -3220,6 +3241,16 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   GEMM because their split writers require three GEMMs; those writers are used
   only by the >=48k low-headroom route. `parity/minimax_h3_chunked_linear_parity.mojo`
   gates BF16, group-wise INT8, W8A8, Q/K, and final-layer equivalence.
+- `models/dit/minimax_h3_dit.mojo` overwrites an approximate attention output's
+  exact A/V prefix in place rather than slicing/copying its full video tail and
+  concatenating a new result in every block. The final pure-Mojo
+  864x480x243/S=32,392 CLI gate measured 24.442 s for the hot evaluation,
+  16,394 MiB sampled H3 VRAM, and byte-identical latent/motion artifacts. The
+  one-shot Rust launcher also retains the immutable 18.0-GiB streamed W8A8 tail
+  under the bounded 24-GiB host-memory wrapper. The existing 19.21-s Comfy
+  comparator remains 27.24% faster; next work is per-block sync/allocation and
+  streamed-weight staging. Evidence and exact resume commands:
+  `HANDOFF_2026-08-26_minimax-h3-native-inference-speed.md`.
 - `ops/norm.mojo::rms_norm_modulate_bf16` is the exact inference fusion for
   H3's BF16 RMSNorm -> per-token AdaLN boundary. It duplicates the scalar
   256-thread F32 reduction order and explicitly rounds the normed value to BF16
@@ -3922,6 +3953,13 @@ i2va (square keyframe 768x768, S=43,828, identity carried 10.125s).
   as fine mosaic with intact global structure.
   ROW LAW: video rows are CHANNEL-SLOWEST (c,pt,ph,pw); unpatchify3d reads
   channel-fastest, so reorder before it.
+  The audit-only `--evidence-dir` path saves real Qwen3-VL conditioning,
+  matched starting rows, first-evaluation block 1/3/5/10/20/50 boundaries,
+  final heads, and the first Euler state. `--eval-start`/`--eval-stop` retain
+  split-run recovery without changing schedule semantics. These boundaries
+  produced the 2026-08-30 natural-language Compiler A/B; the authoritative
+  report is
+  `/home/alex/diffusion-compiler/docs/H3_NATURAL_LANGUAGE_QUALITY_GATE_2026-08-30.md`.
 - `pipeline/minimax_h3_video_vae_{temporal,spatial_tiling,blend,pixel_norm}
   .mojo` — chunk+tile+blend decode stack; tiled path vendor-oracle 2e-5 at
   production geometry; ONE shared blend like klvae.

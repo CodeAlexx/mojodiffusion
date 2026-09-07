@@ -304,6 +304,7 @@ pub async fn get_object_info() -> Response {
     let mut artifacts = crate::models::artifact_name_inventory();
     let vaes = artifacts.remove("vae").unwrap_or_default();
     let clips = artifacts.remove("clip").unwrap_or_default();
+    let controlnets = artifacts.remove("controlnet").unwrap_or_default();
     let clip_vision = artifacts
         .remove("clip_vision")
         .filter(|names| !names.is_empty())
@@ -346,6 +347,60 @@ pub async fn get_object_info() -> Response {
             "output": ["MODEL","CLIP","VAE"], "output_name": ["MODEL","CLIP","VAE"], "name": "CheckpointLoaderSimple", "category": "loaders" },
         "UNETLoader": { "input": { "required": { "unet_name": combo(&models), "weight_dtype": combo(&dtypes) } },
             "output": ["MODEL"], "output_name": ["MODEL"], "name": "UNETLoader", "category": "loaders" },
+        "MiniMaxH3TextEncode": { "input": { "required": {
+                "clip_name": combo(&clips), "prompt": text_w()
+            } },
+            "output": ["CONDITIONING"], "output_name": ["conditioning"], "name": "MiniMax H3 Text Encode", "category": "MiniMax H3" },
+        "MiniMaxH3Loader": { "input": { "required": {
+                "unet_name": combo(&models),
+                "window": int(2,2,8), "prefetch": int(1,1,4),
+                "attention_backend": combo(&["ck-int8".into()])
+            } },
+            "output": ["MODEL","H3_STREAMER"], "output_name": ["model","streamer"], "name": "MiniMax H3 Loader", "category": "MiniMax H3" },
+        "MiniMaxH3EmptyLatent": { "input": { "required": {
+                "width": int(1344,32,2048), "height": int(768,32,2048),
+                "length": int(124,5,362), "output_frames": int(120,120,360)
+            } },
+            "output": ["LATENT"], "output_name": ["latent"], "name": "MiniMax H3 Empty Latent", "category": "MiniMax H3" },
+        "MiniMaxH3SigmaShift": { "input": { "required": {
+                "shift_video": fl(12.0,0.0,30.0), "shift_audio": fl(3.0,0.0,30.0)
+            } },
+            "output": ["H3_SHIFT"], "output_name": ["shift"], "name": "MiniMax H3 Sigma Shift", "category": "MiniMax H3" },
+        "MiniMaxH3FunControlNetLoader": { "input": { "required": {
+                "model": lk("MODEL"), "control_net_name": combo(&controlnets)
+            } },
+            "output": ["CONTROL_NET"], "output_name": ["control_net"], "name": "MiniMax H3 Fun ControlNet Loader", "category": "MiniMax H3/ControlNet" },
+        "MiniMaxH3FunControlNetApplyMedia": { "input": { "required": {
+                "conditioning": lk("CONDITIONING"), "latent": lk("LATENT"),
+                "control_net": lk("CONTROL_NET"), "video_vae_name": combo(&vaes),
+                "control_media": str_w(),
+                "preprocessor": combo(&["prepared".into(),"canny".into()]),
+                "resize_mode": combo(&["crop".into(),"pad".into(),"stretch".into()]),
+                "canny_low": int(100,0,255), "canny_high": int(200,0,255),
+                "strength": fl(1.0,-20.0,20.0),
+                "start_percent": fl(0.0,0.0,1.0), "end_percent": fl(1.0,0.0,1.0)
+            }, "optional": {
+                "source_media": str_w(), "mask_media": str_w(),
+                "invert_mask": json!(["BOOLEAN", {"default": false}])
+            } },
+            "output": ["CONDITIONING"], "output_name": ["conditioning"], "name": "MiniMax H3 Fun ControlNet Apply Media", "category": "MiniMax H3/ControlNet" },
+        "MiniMaxH3Sampler": { "input": { "required": {
+                "model": lk("MODEL"), "streamer": lk("H3_STREAMER"),
+                "conditioning": lk("CONDITIONING"), "latent": lk("LATENT"),
+                "shift": lk("H3_SHIFT"), "seed": int(0,0,4294967295),
+                "steps": int(21,3,51), "sampler_name": combo(&["euler".into()]),
+                "scheduler": combo(&["normal".into()])
+            } },
+            "output": ["LATENT"], "output_name": ["latent"], "name": "MiniMax H3 Sampler", "category": "MiniMax H3" },
+        "MiniMaxH3DecodeRelease": { "input": { "required": {
+                "latent": lk("LATENT"), "video_vae_name": combo(&vaes),
+                "audio_vae_name": combo(&vaes)
+            } },
+            "output": ["IMAGE","AUDIO"], "output_name": ["images","audio"], "name": "MiniMax H3 Decode Release", "category": "MiniMax H3" },
+        "CreateVideo": { "input": { "required": {
+                "images": lk("IMAGE"), "audio": lk("AUDIO"), "fps": int(24,24,24)
+            } },
+            "output": ["VIDEO"], "output_name": ["video"], "name": "Create Video", "category": "video" },
         "LTXVLoader": { "input": { "required": {
                 "checkpoint_path": combo(&models),
                 "gemma_path": str_w(),
@@ -514,7 +569,11 @@ pub async fn get_object_info() -> Response {
             "output": ["LATENT"], "output_name": ["LATENT"], "name": "EmptyLatentVideo", "category": "video" },
         "SaveImage": { "input": { "required": { "images": lk("IMAGE"), "filename_prefix": str_w() } },
             "output": [], "output_name": [], "name": "SaveImage", "category": "image" },
-        "SaveVideo": { "input": { "required": { "video": lk("VIDEO"), "filename_prefix": str_w() } },
+        "SaveVideo": { "input": { "required": {
+                "video": lk("VIDEO"), "filename_prefix": str_w(),
+                "fps": int(24,24,24),
+                "format": combo(&["mp4".into(),"mov".into(),"mkv".into()])
+            } },
             "output": [], "output_name": [], "name": "SaveVideo", "category": "video" },
         "SaveAnimatedWEBP": { "input": { "required": { "images": lk("IMAGE"), "filename_prefix": str_w(), "fps": int(24,24,24) } },
             "output": [], "output_name": [], "name": "SaveAnimatedWEBP", "category": "video" },

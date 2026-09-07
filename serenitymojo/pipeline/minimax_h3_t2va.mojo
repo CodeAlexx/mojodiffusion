@@ -261,6 +261,10 @@ from serenitymojo.ops.tensor_algebra import (
     reshape, permute, slice, add, mul, mul_scalar, concat,
 )
 from serenitymojo.serve.product_manifest import json_escape, json_bool, write_text_file
+from serenitymojo.serve.profile_capture import (
+    profile_capture_start,
+    profile_capture_stop,
+)
 from serenitymojo.audio.wav import save_wav
 
 from serenitymojo.models.dit.minimax_h3_dit import (
@@ -323,6 +327,19 @@ from serenitymojo.models.dit.minimax_h3_modcache import (
     minimax_h3_check_modcache_weights,
     minimax_h3_build_modulation_cache,
 )
+from serenitymojo.models.dit.minimax_h3_controlnet import (
+    MiniMaxH3ControlInput,
+    MiniMaxH3ControlRuntime,
+    minimax_h3_controlnet_preflight,
+    minimax_h3_control_runtime,
+    minimax_h3_control_init_hidden,
+    minimax_h3_control_inject_active,
+)
+from serenitymojo.pipeline.minimax_h3_control_media import (
+    MINIMAX_H3_CONTROL_FPS,
+    MiniMaxH3ControlMediaSpec,
+    minimax_h3_prepare_control_inputs,
+)
 from serenitymojo.models.dit.minimax_h3_runtime_cache import (
     load_minimax_h3_modcache,
     load_minimax_h3_resident_cache,
@@ -349,6 +366,9 @@ from serenitymojo.models.dit.minimax_h3_frontend import (
     MiniMaxH3FrontendOutput,
     minimax_h3_frontend_embed,
     minimax_h3_frontend_embed_dynamic,
+    minimax_h3_condition_embed,
+    minimax_h3_token_refiner,
+    minimax_h3_token_refiner_dynamic,
     minimax_h3_final_layer,
     minimax_h3_timestep_embedding,
 )
@@ -1618,6 +1638,37 @@ def _assert_finite_rows(
         )
 
 
+def _save_h3_evidence_tensor(
+    path: String, name: String, tensor: Tensor, ctx: DeviceContext
+) raises:
+    """Persist one request tensor without changing the live device value."""
+    var names = List[String]()
+    names.append(name)
+    var tensors = List[ArcPointer[Tensor]]()
+    tensors.append(ArcPointer[Tensor](tensor.clone(ctx)))
+    save_safetensors(names, tensors, path, ctx)
+    print("  evidence: saved", name, "->", path)
+
+
+def _save_h3_evidence_pair(
+    path: String,
+    first_name: String,
+    first: Tensor,
+    second_name: String,
+    second: Tensor,
+    ctx: DeviceContext,
+) raises:
+    """Persist a matched A/V boundary while retaining both live tensors."""
+    var names = List[String]()
+    names.append(first_name)
+    names.append(second_name)
+    var tensors = List[ArcPointer[Tensor]]()
+    tensors.append(ArcPointer[Tensor](first.clone(ctx)))
+    tensors.append(ArcPointer[Tensor](second.clone(ctx)))
+    save_safetensors(names, tensors, path, ctx)
+    print("  evidence: saved", first_name, "+", second_name, "->", path)
+
+
 def _minimax_h3_get_modcache_cached(
     shards: ShardedSafeTensors,
     temb: Tensor,
@@ -1730,6 +1781,9 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
     step_index: Int,
     mut step_cache: MiniMaxH3StepCache,
     t2va_contiguous: Bool,
+    ref control_runtime: Optional[MiniMaxH3ControlRuntime],
+    control_progress: Float32,
+    evidence_dir: String,
     ctx: DeviceContext,
 ) raises -> MiniMaxH3FrontendOutput:
     var sequence_length = geometry.sequence_length
@@ -1768,6 +1822,30 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
     var hidden3 = reshape(
         embed.hidden, [1, sequence_length, config.hidden_size], ctx
     )
+    var active_controls = List[Int]()
+    var control_hidden = List[ArcPointer[Tensor]]()
+    if control_runtime:
+        if not t2va_contiguous:
+            raise Error("MiniMax-H3 ControlNet requires contiguous T2VA packing")
+        for control in range(len(control_runtime.value().inputs)):
+            var strength = control_runtime.value().inputs[control].strength
+            var start_percent = control_runtime.value().inputs[control].start_percent
+            var end_percent = control_runtime.value().inputs[control].end_percent
+            if (
+                strength != Float32(0.0)
+                and start_percent <= control_progress
+                and control_progress <= end_percent
+            ):
+                # Detach the guide Arc's tensor value before borrowing the
+                # runtime projections; Mojo correctly rejects two interior
+                # borrows of the same Movable runtime in one call.
+                var guide = control_runtime.value().inputs[control].rows[].clone(ctx)
+                var c = minimax_h3_control_init_hidden(
+                    hidden3, guide, control_runtime.value(),
+                    len(geometry.video_indices), config, ctx,
+                )
+                active_controls.append(control)
+                control_hidden.append(ArcPointer[Tensor](c^))
     # At H3 Base's full-area long-video shapes, the frontend leaves several
     # GiB of completed projection/packing buffers pending behind the stream.
     # Fence once before block 0 so the allocator can reclaim those buffers;
@@ -1910,6 +1988,35 @@ def _minimax_h3_model_eval_p[TEXT_S: Int](
         # can overlap two weight blocks and lose several GiB of VRAM headroom.
         block_w.clear()
         if (
+            control_runtime
+            and len(active_controls) > 0
+            and layer % 10 == 0
+            and layer <= 40
+        ):
+            hidden3 = minimax_h3_control_inject_active[
+                H3_HEADS, H3_HEAD_DIM
+            ](
+                hidden3^, control_hidden, active_controls,
+                control_runtime.value(), layer // 10, config,
+                block_adaln_indices, cos, sin, rotary_dim,
+                len(geometry.text_indices), len(geometry.audio_indices),
+                attention_backend, sage_scratch, comfy_kitchen_scratch,
+                evg_layout, step_index, ctx,
+            )
+        if (
+            evidence_dir != String("")
+            and step_index == 0
+            and (
+                layer == 0 or layer == 2 or layer == 4 or layer == 9
+                or layer == 19 or layer == 49
+            )
+        ):
+            _save_h3_evidence_tensor(
+                evidence_dir + String("/serenity_first_eval_after_block_")
+                + String(layer + 1) + String(".safetensors"),
+                String("hidden"), hidden3, ctx,
+            )
+        if (
             step_cache.enabled
             and layer == MINIMAX_H3_CACHE_FRONT_BLOCKS - 1
         ):
@@ -1999,6 +2106,8 @@ def _job_main(raw_args: List[String]) raises:
     var runtime_cache = False
     var prepare_runtime_cache = False
     var validate_request = False
+    var profile_denoise = False
+    var evidence_dir = String("")
     var eval_start = 0
     var eval_stop = -1
     var motion_context_path = String("")
@@ -2007,6 +2116,18 @@ def _job_main(raw_args: List[String]) raises:
     var endless_boundary_frames = 0
     var endless_boundary_audio_latents = 0
     var temporal_rope_scale = Float32(1.0)
+    var controlnet_path = String("")
+    var control_media = List[String]()
+    var control_preprocessor = List[String]()
+    var control_resize = List[String]()
+    var control_canny_low = List[Int]()
+    var control_canny_high = List[Int]()
+    var control_strength = List[Float32]()
+    var control_start = List[Float32]()
+    var control_end = List[Float32]()
+    var control_source = List[String]()
+    var control_mask = List[String]()
+    var control_invert_mask = List[Bool]()
     for i in range(len(raw_args)):
         var arg = String(raw_args[i])
         if arg.startswith("--width="):
@@ -2160,6 +2281,15 @@ def _job_main(raw_args: List[String]) raises:
         if arg == String("--validate-request"):
             validate_request = True
             continue
+        if arg == String("--profile-denoise"):
+            profile_denoise = True
+            continue
+        if arg.startswith("--evidence-dir="):
+            var fields = arg.split("=")
+            if len(fields) != 2 or String(fields[1]) == String(""):
+                raise Error("invalid --evidence-dir flag")
+            evidence_dir = String(fields[1])
+            continue
         if arg.startswith("--eval-start="):
             var fields = arg.split("=")
             if len(fields) != 2:
@@ -2208,7 +2338,114 @@ def _job_main(raw_args: List[String]) raises:
                 raise Error("invalid --temporal-rope-scale flag")
             temporal_rope_scale = _h3_parse_f32(String(fields[1]))
             continue
+        if arg.startswith("--controlnet="):
+            var fields = arg.split("=")
+            if len(fields) != 2 or String(fields[1]) == String(""):
+                raise Error("invalid --controlnet flag")
+            controlnet_path = String(fields[1])
+            continue
+        if arg.startswith("--control-media="):
+            var fields = arg.split("=")
+            if len(fields) != 2 or String(fields[1]) == String(""):
+                raise Error("invalid --control-media flag")
+            control_media.append(String(fields[1]))
+            continue
+        if arg.startswith("--control-preprocessor="):
+            var fields = arg.split("=")
+            control_preprocessor.append(String(fields[1]))
+            continue
+        if arg.startswith("--control-resize="):
+            var fields = arg.split("=")
+            control_resize.append(String(fields[1]))
+            continue
+        if arg.startswith("--control-canny-low="):
+            var fields = arg.split("=")
+            control_canny_low.append(atol(String(fields[1])))
+            continue
+        if arg.startswith("--control-canny-high="):
+            var fields = arg.split("=")
+            control_canny_high.append(atol(String(fields[1])))
+            continue
+        if arg.startswith("--control-strength="):
+            var fields = arg.split("=")
+            control_strength.append(_h3_parse_f32(String(fields[1])))
+            continue
+        if arg.startswith("--control-start="):
+            var fields = arg.split("=")
+            control_start.append(_h3_parse_f32(String(fields[1])))
+            continue
+        if arg.startswith("--control-end="):
+            var fields = arg.split("=")
+            control_end.append(_h3_parse_f32(String(fields[1])))
+            continue
+        if arg.startswith("--control-source="):
+            var fields = arg.split("=")
+            control_source.append(String(fields[1]))
+            continue
+        if arg.startswith("--control-mask="):
+            var fields = arg.split("=")
+            control_mask.append(String(fields[1]))
+            continue
+        if arg.startswith("--control-invert-mask="):
+            var fields = arg.split("=")
+            var value = String(fields[1])
+            if value != String("0") and value != String("1"):
+                raise Error("--control-invert-mask must be 0 or 1")
+            control_invert_mask.append(value == String("1"))
+            continue
         args.append(arg)
+    var control_enabled = controlnet_path != String("")
+    if control_enabled != (len(control_media) > 0):
+        raise Error("--controlnet and at least one --control-media are required together")
+    var control_count = len(control_media)
+    if control_count > 4:
+        raise Error("MiniMax-H3 ControlNet supports at most four controls")
+    if control_enabled:
+        if len(control_preprocessor) == 0:
+            for _ in range(control_count): control_preprocessor.append(String("prepared"))
+        if len(control_resize) == 0:
+            for _ in range(control_count): control_resize.append(String("crop"))
+        if len(control_canny_low) == 0:
+            for _ in range(control_count): control_canny_low.append(100)
+        if len(control_canny_high) == 0:
+            for _ in range(control_count): control_canny_high.append(200)
+        if len(control_strength) == 0:
+            for _ in range(control_count): control_strength.append(Float32(1.0))
+        if len(control_start) == 0:
+            for _ in range(control_count): control_start.append(Float32(0.0))
+        if len(control_end) == 0:
+            for _ in range(control_count): control_end.append(Float32(1.0))
+        if len(control_source) == 0:
+            for _ in range(control_count): control_source.append(String("-"))
+        if len(control_mask) == 0:
+            for _ in range(control_count): control_mask.append(String("-"))
+        if len(control_invert_mask) == 0:
+            for _ in range(control_count): control_invert_mask.append(False)
+        if (
+            len(control_preprocessor) != control_count
+            or len(control_resize) != control_count
+            or len(control_canny_low) != control_count
+            or len(control_canny_high) != control_count
+            or len(control_strength) != control_count
+            or len(control_start) != control_count
+            or len(control_end) != control_count
+            or len(control_source) != control_count
+            or len(control_mask) != control_count
+            or len(control_invert_mask) != control_count
+        ):
+            raise Error("MiniMax-H3 ControlNet repeated option counts must match media count")
+    var control_specs = List[MiniMaxH3ControlMediaSpec]()
+    for i in range(control_count):
+        control_specs.append(
+            MiniMaxH3ControlMediaSpec(
+                control_media[i], control_preprocessor[i], control_resize[i],
+                control_canny_low[i], control_canny_high[i], control_strength[i],
+                control_start[i], control_end[i],
+                String("") if control_source[i] == String("-") else control_source[i],
+                String("") if control_mask[i] == String("-") else control_mask[i],
+                control_invert_mask[i],
+            )
+        )
     var motion_context_enabled = motion_context_path != String("")
     var endless_boundary_enabled = endless_boundary_frames > 0
     if motion_context_enabled:
@@ -2233,6 +2470,12 @@ def _job_main(raw_args: List[String]) raises:
             "--endless-boundary-audio-latents requires"
             " --endless-boundary-frames"
         )
+    if control_enabled and motion_context_enabled:
+        raise Error("MiniMax-H3 ControlNet is T2VA-only and cannot use motion context")
+    if control_enabled and step_cache_enabled:
+        raise Error("MiniMax-H3 ControlNet requires --step-cache=exact")
+    if control_enabled and runtime_fps != MINIMAX_H3_CONTROL_FPS:
+        raise Error("MiniMax-H3 ControlNet media and inference must run at 24 FPS")
     if (
         attention_backend == MINIMAX_H3_ATTN_EVG_INT8
         and motion_context_enabled
@@ -2344,6 +2587,8 @@ def _job_main(raw_args: List[String]) raises:
             " [--runtime-cache-exact-product-prompt]"
             " [--prepare-runtime-cache]"
             " [--validate-request]"
+            " [--profile-denoise]"
+            " [--evidence-dir=PATH]"
             " [--eval-start=N] [--eval-stop=N]"
             " [--motion-context=PATH]"
             " [--motion-context-frames=5|22|39]"
@@ -2351,6 +2596,7 @@ def _job_main(raw_args: List[String]) raises:
             " [--endless-boundary-frames=5]"
             " [--endless-boundary-audio-latents=N]"
             " [--temporal-rope-scale=F]"
+            " [--controlnet=PATH --control-media=PATH ...]"
             " [--defer-video-decode]"
         )
         print(
@@ -2685,6 +2931,11 @@ def _job_main(raw_args: List[String]) raises:
 
     if partial_mode:
         print("")
+    if control_enabled and partial_mode:
+        raise Error("MiniMax-H3 ControlNet is not admitted in partial-block mode")
+    if control_enabled:
+        minimax_h3_controlnet_preflight(controlnet_path, config)
+        print("  preflight: native ControlNet Union OK:", controlnet_path)
         print("  ################################################################")
         print("  # PARTIAL MODE:", max_blocks, "of", config.num_layers, "transformer blocks.")
         print("  # Conditioning is STUBBED (fixed-seed random, NOT the real prompt).")
@@ -2727,8 +2978,23 @@ def _job_main(raw_args: List[String]) raises:
     print("  preflight OK (", Float64(t_preflight1 - t_preflight0) / 1.0e6, "ms)")
 
     _ = sys_system(String("mkdir -p '") + out_dir + "'")
+    if evidence_dir != String(""):
+        var evidence_mkdir_rc = sys_system(
+            String("mkdir -p ") + shell_quote(evidence_dir)
+        )
+        if evidence_mkdir_rc != 0:
+            raise Error("MiniMax-H3 could not create the evidence directory")
 
     var ctx = DeviceContext()
+    var control_inputs = List[MiniMaxH3ControlInput]()
+    if control_enabled:
+        print("  phase=control-media preparing", control_count, "native guide(s)")
+        control_inputs = minimax_h3_prepare_control_inputs(
+            control_specs, String(VIDEO_VAE_DIR), out_dir, runtime_width,
+            runtime_height, runtime_frames, ctx,
+        )
+        ctx.synchronize()
+        print("  phase=control-media ready", len(control_inputs), "guide(s)")
     if lora_path != String(""):
         print("  loading LoRA overlay:", lora_path, " mult:", lora_mult)
         _lora_overlay = Optional[H3LoraOverlay](
@@ -2754,6 +3020,11 @@ def _job_main(raw_args: List[String]) raises:
     var text_rows = reshape(
         cond.embeds, [runtime_text_tokens, config.text_dim], ctx
     )
+    if evidence_dir != String(""):
+        _save_h3_evidence_tensor(
+            evidence_dir + String("/conditioning.safetensors"),
+            String("text_conditioning"), text_rows, ctx,
+        )
     var t_cond1 = perf_counter_ns()
     print(
         "  conditioning", "[STUBBED]" if partial_mode else "[real]", ": ",
@@ -2994,6 +3265,19 @@ def _job_main(raw_args: List[String]) raises:
         modcache_path,
         ctx,
     )
+    var _control_runtime = Optional[MiniMaxH3ControlRuntime](None)
+    if control_enabled:
+        _control_runtime = Optional[MiniMaxH3ControlRuntime](
+            minimax_h3_control_runtime(
+                controlnet_path, temb, config, control_inputs^, ctx
+            )
+        )
+        print(
+            "  control modcache:",
+            Float64(_control_runtime.value().modcache.total_bytes())
+                / (1024.0 * 1024.0),
+            "MiB",
+        )
     ctx.synchronize()
     var t_mod1 = perf_counter_ns()
     print(
@@ -3100,6 +3384,27 @@ def _job_main(raw_args: List[String]) raises:
         print("  runtime cache preparation complete; denoise intentionally skipped")
         return
 
+    # The text rows and frontend weights are request-invariant. Match the
+    # reference H3 orchestration by running condition_proj + the two token
+    # refiner blocks once before sampling instead of once per model evaluation.
+    var t_refine0 = perf_counter_ns()
+    var condition_rows = minimax_h3_condition_embed(text_rows, frontend_w, ctx)
+    var refined_text_rows: Tensor
+    if runtime_text_tokens == 241:
+        refined_text_rows = minimax_h3_token_refiner[
+            241, H3_HEADS, H3_HEAD_DIM
+        ](condition_rows, frontend_w, config, ctx, _lora_overlay)
+    else:
+        refined_text_rows = minimax_h3_token_refiner_dynamic[
+            H3_HEADS, H3_HEAD_DIM
+        ](condition_rows, frontend_w, config, ctx, _lora_overlay)
+    ctx.synchronize()
+    var t_refine1 = perf_counter_ns()
+    print(
+        "  text frontend: refined once for sampling (",
+        Float64(t_refine1 - t_refine0) / 1.0e9, "s)",
+    )
+
     # ── 6. Denoise loop — real streamed blocks, real Euler steps ───────────
     var t_denoise0 = perf_counter_ns()
     var video_shape: List[Int] = [num_video_rows, config.video_patch_dim()]
@@ -3109,6 +3414,12 @@ def _job_main(raw_args: List[String]) raises:
     if eval_start == 0:
         video_state = randn(video_shape^, seed, STDtype.F32, ctx)
         audio_state = randn(audio_shape^, seed + 1, STDtype.F32, ctx)
+        if evidence_dir != String(""):
+            _save_h3_evidence_pair(
+                evidence_dir + String("/initial_state.safetensors"),
+                String("video_state_rows"), video_state,
+                String("audio_state_rows"), audio_state, ctx,
+            )
     else:
         var resume_path = out_dir + String("/resume_latents.safetensors")
         var resume_st = SafeTensors.open(resume_path)
@@ -3226,6 +3537,8 @@ def _job_main(raw_args: List[String]) raises:
                 / (1024.0 * 1024.0 * 1024.0),
             "GiB for S=", geometry.sequence_length,
         )
+    if profile_denoise:
+        profile_capture_start()
     var step_cache = MiniMaxH3StepCache(step_cache_enabled, num_steps)
     var adaptive_ck_calls_total = 0
     var adaptive_cudnn_calls_total = 0
@@ -3341,7 +3654,7 @@ def _job_main(raw_args: List[String]) raises:
                 0, ctx, condition_audio_rows.value(), audio_state
             )
             var frontend_out = _minimax_h3_model_eval_p[241](
-                video_rows_combined, audio_rows_combined, text_rows,
+                video_rows_combined, audio_rows_combined, refined_text_rows,
                 placeholder_ts, geometry, frontend_w, config, run_config,
                 modcache, global_row, block_adaln_indices,
                 transformer_shards, fp8_resident, reusable_w8a8_tail,
@@ -3352,6 +3665,8 @@ def _job_main(raw_args: List[String]) raises:
                 adaptive_sm120_scratch, adaptive_sink_tokens,
                 evg_layout, i,
                 step_cache, False,
+                _control_runtime, video_ts,
+                evidence_dir,
                 ctx,
             )
             var target_video_out = slice(
@@ -3362,6 +3677,13 @@ def _job_main(raw_args: List[String]) raises:
                 frontend_out.audio_out, 0, num_condition_audio_rows,
                 num_audio_rows, ctx,
             )
+            if evidence_dir != String("") and i == 0:
+                _save_h3_evidence_pair(
+                    evidence_dir
+                    + String("/serenity_first_eval_heads.safetensors"),
+                    String("video_velocity"), target_video_out,
+                    String("audio_velocity"), target_audio_out, ctx,
+                )
             video_state = schedule.step_video_device(
                 target_video_out, video_ts, video_state, ctx
             )
@@ -3370,7 +3692,8 @@ def _job_main(raw_args: List[String]) raises:
             )
         else:
             var frontend_out = _minimax_h3_model_eval_p[241](
-                video_state, audio_state, text_rows, placeholder_ts, geometry,
+                video_state, audio_state, refined_text_rows, placeholder_ts,
+                geometry,
                 frontend_w, config, run_config, modcache, global_row,
                 block_adaln_indices, transformer_shards, fp8_resident,
                 reusable_w8a8_tail,
@@ -3381,13 +3704,28 @@ def _job_main(raw_args: List[String]) raises:
                 adaptive_sm120_scratch, adaptive_sink_tokens,
                 evg_layout, i,
                 step_cache, True,
+                _control_runtime, video_ts,
+                evidence_dir,
                 ctx,
             )
+            if evidence_dir != String("") and i == 0:
+                _save_h3_evidence_pair(
+                    evidence_dir
+                    + String("/serenity_first_eval_heads.safetensors"),
+                    String("video_velocity"), frontend_out.video_out,
+                    String("audio_velocity"), frontend_out.audio_out, ctx,
+                )
             video_state = schedule.step_video_device(
                 frontend_out.video_out, video_ts, video_state, ctx
             )
             audio_state = schedule.step_audio_device(
                 frontend_out.audio_out, audio_ts, audio_state, ctx
+            )
+        if evidence_dir != String("") and i == 0:
+            _save_h3_evidence_pair(
+                evidence_dir + String("/serenity_after_eval_1.safetensors"),
+                String("video_state_rows"), video_state,
+                String("audio_state_rows"), audio_state, ctx,
             )
         ctx.synchronize()
         var t_step1 = perf_counter_ns()
@@ -3457,6 +3795,8 @@ def _job_main(raw_args: List[String]) raises:
         var final_left = concat(0, ctx, clean_audio_left, final_audio_left)
         var final_right = concat(0, ctx, clean_audio_right, final_audio_right)
         audio_state = concat(0, ctx, final_left, final_right)
+    if profile_denoise:
+        profile_capture_stop()
 
     # Quantized product paths fail at the latent boundary instead of surfacing
     # later as a misleading VAE/pixel error.  The scans and reductions run on
@@ -3602,7 +3942,6 @@ def _job_main(raw_args: List[String]) raises:
     result_body += String("}\n")
     write_text_file(out_dir + String("/result.json"), result_body)
     print("  wrote", out_dir + String("/result.json"))
-
     # A resident DiT store and the GPU video VAE cannot coexist in 24 GiB.
     # A wrapper can now end this process, release its CUDA context, and invoke
     # decode_only in a fresh GPU process.  There is no CPU inference fallback.

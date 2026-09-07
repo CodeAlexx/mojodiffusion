@@ -1207,7 +1207,7 @@ fn post_video_blocking(st: AppState, body: String) -> Response {
         let task = minimax_h3_task(&b).to_string();
         let missing = if minimax_h3_continue_with_references(&b) {
             minimax_h3_conditioned_missing("ref2va", quant)
-        } else if matches!(task.as_str(), "t2va" | "continue") {
+        } else if matches!(task.as_str(), "t2va" | "continue" | "controlnet") {
             minimax_h3_missing(minimax_h3_default_profile(), quant)
         } else {
             minimax_h3_conditioned_missing(&task, quant)

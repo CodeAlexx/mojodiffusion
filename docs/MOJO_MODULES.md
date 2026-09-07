@@ -829,7 +829,19 @@ edits: see sections C and D of the parity-ported doc.
 - Rust remains the capability/request control plane; image editing, reference
   VAE encode, LanPaint sampling, and pixel output remain in the Mojo workers.
 
-## MiniMax-H3 audio-video inference runtime (updated 2026-08-20)
+## MiniMax-H3 audio-video inference runtime (updated 2026-08-26)
+
+- `models/dit/minimax_h3_controlnet.mojo` streams the released
+  MiniMax-H3-Fun-Controlnet-Union checkpoint one side block at a time and adds
+  its `after_proj` residual to the packed stream after base layers
+  0/10/20/30/40, scaled by the per-control strength and zeroed on audio rows.
+  `pipeline/minimax_h3_control_media.mojo` decodes/resizes the guide media and
+  builds the 49-channel union latent. Both map the diffusers-order checkpoint
+  onto the native block ABI: split `attn.to_{q,k,v}` concatenate directly to
+  the contiguous [Q;K;V] thirds, and `ff.net.0.proj` is passed through
+  UNCHANGED — it is already [value; gate]. Applying the base loader's
+  de-interleave or fc1 half-swap here silently corrupts every side block; see
+  the WEIGHT-LAYOUT LAW in `serenitymojo/MAP.md` for the measured cosines.
 
 - `models/dit/minimax_h3_runtime_cache.mojo` owns the versioned conditioning,
   modulation, and resident-weight sidecars used by the product runners. Cache
@@ -852,6 +864,15 @@ edits: see sections C and D of the parity-ported doc.
   three GEMMs; those split writers remain available for the >=48k low-headroom
   path. `models/dit/parity/minimax_h3_chunked_linear_parity.mojo` gates the
   chunked/fused BF16, group-wise, W8A8, QKV, Q/K, and final-layer paths.
+- `models/dit/minimax_h3_dit.mojo` performs exact-prefix attention replacement
+  with a small in-place device copy, preserving the approximate video tail and
+  removing two full-output allocations/frees per transformer block. The
+  one-shot Rust launcher uses the bounded 24-GiB host wrapper so the immutable
+  18.0-GiB packed W8A8 tail stays cached between evaluations. The final
+  pure-Mojo 864x480x243/S=32,392 gate was byte exact, hot at 24.442 s, and
+  sampled 16,394 MiB H3 VRAM. It is still 27.24% slower than the existing
+  19.21-s Comfy comparator. Full evidence and rejected experiments are in
+  `HANDOFF_2026-08-26_minimax-h3-native-inference-speed.md`.
 - `ops/norm.mojo::rms_norm_modulate_bf16` preserves the scalar RMSNorm F32
   reduction and explicitly rounds/re-upcasts the intermediate BF16 value before
   token-addressed AdaLN math, making it bit-identical to the former two-kernel

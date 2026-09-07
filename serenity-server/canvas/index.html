@@ -15,6 +15,7 @@
     <link rel="stylesheet" href="css/settings.css">
     <link rel="stylesheet" href="css/video-edit.css">
     <link rel="stylesheet" href="css/h3-studio.css">
+    <link rel="stylesheet" href="css/h3-control.css">
     <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
 </head>
 <body>
@@ -59,6 +60,10 @@
                 <button class="nav-btn" data-tab="h3-studio" title="H3 Studio">
                     <i data-lucide="clapperboard"></i>
                     <div class="tooltip">H3 Studio</div>
+                </button>
+                <button class="nav-btn" data-tab="h3-ct" title="H3 ControlNet">
+                    <i data-lucide="scan-line"></i>
+                    <div class="tooltip">H3 ControlNet</div>
                 </button>
                 <button class="nav-btn" data-tab="models" title="Models">
                     <i data-lucide="box"></i>
@@ -187,6 +192,10 @@
             <div class="tab-panel" id="panel-h3-studio" style="display: none">
             </div>
 
+            <div class="tab-panel" id="panel-h3-ct" style="display: none">
+                <div class="placeholder">H3 ControlNet</div>
+            </div>
+
             <div class="tab-panel" id="panel-models" style="display: none">
                 <div class="placeholder">Models</div>
             </div>
@@ -258,6 +267,8 @@
     <!-- Model utilities and workflow builder (shared by Generate + Canvas tabs) -->
     <script src="js/model-utils.js"></script>
     <script src="js/workflow-builder.js"></script>
+    <script src="js/h3-control-bridge.js"></script>
+    <script src="js/h3-control-workflow.js"></script>
 
     <!-- Settings (persistence layer must load before shell.js) -->
     <script src="js/settings.js"></script>
@@ -292,6 +303,9 @@
     <!-- Project-based MiniMax H3 filmmaker workspace -->
     <script src="js/h3-project.js"></script>
     <script src="js/h3-studio.js"></script>
+
+    <!-- Dedicated native Mojo H3 ControlNet inference screen -->
+    <script src="js/h3-control.js"></script>
 
     <!-- Shell navigation (runs after app.js init, switches to saved tab) -->
     <script src="js/shell.js"></script>

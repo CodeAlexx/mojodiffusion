@@ -119,6 +119,9 @@ var H3ProjectContracts = (function () {
             assets: [],
             character_sheets: [],
             endless: createEmptyEndless(120),
+            characters: [],
+            next_character_id: 1,
+            cast_replaces_identities: true,
             shots: [createShot(1, 'Opening shot')],
             next_asset_id: 1,
             next_shot_id: 2,
@@ -246,6 +249,76 @@ var H3ProjectContracts = (function () {
         return out;
     }
 
+    function normalizeCharacter(value) {
+        var c = value || {};
+        return {
+            id: Number(c.id) || 0,
+            name: String(c.name || '').trim() || 'Character',
+            ref_path: String(c.ref_path || '').trim(),
+            ref_url: String(c.ref_url || '').trim(),
+            appearance: String(c.appearance || '').trim()
+        };
+    }
+
+    // The project CAST: recurring identities that every shot inherits. Explicit
+    // project.characters first; if none are defined, fall back to any built
+    // character_sheets (their source portrait + identity_lock). This is what makes
+    // face + wardrobe stay consistent shot to shot instead of being re-invented.
+    function castMembers(project) {
+        var chars = (project && Array.isArray(project.characters)) ? project.characters : [];
+        var out = chars.filter(function (c) { return String(c.ref_path || '').trim(); })
+            .map(function (c) { return { name: String(c.name || 'Character').trim(), path: String(c.ref_path).trim(), appearance: String(c.appearance || '').trim() }; });
+        if (!out.length && project && Array.isArray(project.character_sheets)) {
+            project.character_sheets.forEach(function (s) {
+                if ((s.reference_paths || []).length)
+                    out.push({ name: String(s.name || 'Character').trim(), path: s.reference_paths[0], appearance: String(s.identity_lock || '').trim() });
+            });
+        }
+        return out;
+    }
+
+    function castReferences(project) {
+        return castMembers(project).map(function (c) {
+            return {
+                kind: 'image', path: c.path, role: 'subject',
+                note: c.name + (c.appearance ? ' — ' + c.appearance : ' — canonical locked identity'),
+                audio_use: 'reference', duration_seconds: 5
+            };
+        });
+    }
+
+    // Every shot's ACTUAL reference list = cast identities (first, so <Subject 1..N>
+    // are the leads) + the shot's own references, de-duped by path. Cast is not
+    // injected into native continuations (identity comes from the prior frame there).
+    function effectiveReferences(shot, project) {
+        var own = (shot && Array.isArray(shot.references)) ? shot.references.slice() : [];
+        // Native continuations take identity from the prior frame; locked shots are frozen
+        // exactly as approved. Neither inherits the cast.
+        if (shot && (String(shot.continue_from || '').trim() || shot.locked === true)) return own;
+        var cast = castReferences(project);
+        // When a cast exists and is authoritative (default), the cast is the SOLE identity
+        // source: drop the shot's own per-shot subject-image references (the drift source),
+        // keeping source video / keyframe / motion / environment / audio references.
+        if (cast.length && (!project || project.cast_replaces_identities !== false)) {
+            own = own.filter(function (r) { return !(r.kind === 'image' && r.role === 'subject'); });
+        }
+        var merged = cast.concat(own);
+        var seen = {}, out = [];
+        merged.forEach(function (r) {
+            var key = String(r.path || '');
+            if (r.path && seen[key]) return;
+            if (r.path) seen[key] = true;
+            out.push(r);
+        });
+        return out;
+    }
+
+    function castPathSet(project) {
+        var set = {};
+        castMembers(project).forEach(function (c) { set[c.path] = c; });
+        return set;
+    }
+
     function normalizeShot(value, fallbackId) {
         var out = Object.assign(createShot(fallbackId), value || {});
         out.id = Number(out.id) || fallbackId;
@@ -281,6 +354,9 @@ var H3ProjectContracts = (function () {
         out.adult_mode = out.adult_mode === true;
         out.assets = Array.isArray(out.assets) ? out.assets : [];
         out.character_sheets = Array.isArray(out.character_sheets) ? out.character_sheets : [];
+        out.characters = Array.isArray(out.characters) ? out.characters.map(normalizeCharacter) : [];
+        out.next_character_id = Number(out.next_character_id) || (out.characters.reduce(function (m, c) { return Math.max(m, Number(c.id) || 0); }, 0) + 1);
+        out.cast_replaces_identities = out.cast_replaces_identities !== false;
         out.shots = Array.isArray(out.shots) && out.shots.length
             ? out.shots.map(function (shot, index) { return normalizeShot(shot, index + 1); })
             : [createShot(1, 'Opening shot')];
@@ -527,9 +603,10 @@ var H3ProjectContracts = (function () {
         return frames;
     }
 
-    function detectMode(shot) {
+    function detectMode(shot, project) {
         if (String(shot.continue_from || '').trim()) return 'continue';
-        if (shot.references && shot.references.length) return 'ref2va';
+        var refs = project ? effectiveReferences(shot, project) : (shot.references || []);
+        if (refs && refs.length) return 'ref2va';
         if (String(shot.first_frame || '').trim() && String(shot.last_frame || '').trim()) return 'fl2va';
         if (String(shot.first_frame || '').trim()) return 'i2va';
         if (String(shot.last_frame || '').trim()) return 'l2va';
@@ -569,24 +646,54 @@ var H3ProjectContracts = (function () {
         return String(shot.shot_description || shot.brief || 'Describe the visible action, camera movement, dialogue, and synchronized sound for this shot.');
     }
 
-    function refDefinitions(shot) {
-        if (String(shot.subject_definitions || '').trim()) return shot.subject_definitions;
-        return (shot.references || []).map(function (item, index) {
-            var label = referenceLabel(shot.references, index);
-            var source = referenceSourceLabel(shot.references, index);
-            var note = String(item.note || '').trim() || ('the ordered ' + item.kind + ' reference at ' + item.path);
-            if (label !== source) return label + ' is ' + note + ' from ' + source + ', used as reusable visible content in the target video.';
-            if (item.kind === 'image') return label + ' is ' + note + ', used as a concrete keyframe or composition anchor.';
-            if (item.kind === 'video' && item.role === 'source_video') return label + ' is the source video for the target-video edit: ' + note + '.';
-            if (item.kind === 'video') return label + ' provides whole-video motion, camera, cut, or pacing structure: ' + note + '.';
-            return label + ' is the audio ' + item.audio_use + ' reference: ' + note + '.';
-        }).join('\n');
+    function autoDefinition(refs, item, index) {
+        var label = referenceLabel(refs, index);
+        var source = referenceSourceLabel(refs, index);
+        var note = String(item.note || '').trim() || ('the ordered ' + item.kind + ' reference at ' + item.path);
+        if (label !== source) return label + ' is ' + note + ' from ' + source + ', used as reusable visible content in the target video.';
+        if (item.kind === 'image') return label + ' is ' + note + ', used as a concrete keyframe or composition anchor.';
+        if (item.kind === 'video' && item.role === 'source_video') return label + ' is the source video for the target-video edit: ' + note + '.';
+        if (item.kind === 'video') return label + ' provides whole-video motion, camera, cut, or pacing structure: ' + note + '.';
+        return label + ' is the audio ' + item.audio_use + ' reference: ' + note + '.';
     }
 
-    function refRetention(shot) {
-        if (String(shot.retention_analysis || '').trim()) return shot.retention_analysis;
-        return (shot.references || []).map(function (item, index) {
-            var label = referenceLabel(shot.references, index);
+    function refDefinitions(shot, refs, project) {
+        refs = refs || shot.references || [];
+        var cast = castPathSet(project);
+        var hasCast = Object.keys(cast).length > 0;
+        // No cast defined: keep the original behaviour (honour a per-shot override).
+        if (!hasCast) {
+            if (String(shot.subject_definitions || '').trim()) return shot.subject_definitions;
+            return refs.map(function (item, index) { return autoDefinition(refs, item, index); }).join('\n');
+        }
+        // Cast defined: the cast identity is CANONICAL and identical every shot; a
+        // drifting per-shot subject_definitions override is ignored for cast members.
+        var lines = refs.map(function (item, index) {
+            var c = cast[String(item.path || '')];
+            if (!c) return autoDefinition(refs, item, index);
+            var label = referenceLabel(refs, index);
+            var source = referenceSourceLabel(refs, index);
+            var look = c.appearance || 'the same face geometry, hair, skin tone, eye color, body proportions, wardrobe construction, colors, materials, and accessories';
+            return label + ' is ' + c.name + ', a fixed recurring identity taken from ' + source +
+                '. Locked and identical in every shot: ' + look +
+                '. Do not change this person’s face, hair, build, or wardrobe between shots.';
+        });
+        var bible = String((project && project.continuity_bible) || '').trim();
+        if (bible) lines.push('Continuity lock (applies to every shot): ' + bible);
+        return lines.join('\n');
+    }
+
+    function refRetention(shot, refs, project) {
+        refs = refs || shot.references || [];
+        var cast = castPathSet(project);
+        var hasCast = Object.keys(cast).length > 0;
+        if (!hasCast && String(shot.retention_analysis || '').trim()) return shot.retention_analysis;
+        return refs.map(function (item, index) {
+            var label = referenceLabel(refs, index);
+            if (hasCast && cast[String(item.path || '')]) {
+                return label + ': fully_preserved - ' + cast[String(item.path || '')].name +
+                    '’s face, hair, skin tone, body, and wardrobe are identical to the reference and to every other shot; nothing about this character changes shot to shot.';
+            }
             var relation = 'fully_preserved';
             var explanation = 'the referenced visual identity and defining attributes remain consistent in the target shot.';
             if (item.kind === 'video' && item.role === 'source_video') {
@@ -605,18 +712,23 @@ var H3ProjectContracts = (function () {
         }).join('\n');
     }
 
-    function compilePrompt(shot) {
-        if (String(shot.prompt_override || '').trim()) return shot.prompt_override;
-        var mode = detectMode(shot);
+    function compilePrompt(shot, project) {
+        var refs = effectiveReferences(shot, project);
+        var hasCast = Object.keys(castPathSet(project)).length > 0;
+        // Honour an explicit override, EXCEPT when a cast must be enforced on an
+        // unlocked shot (that override is the drift source we are fixing). A locked
+        // shot always keeps its exact prompt.
+        if (String(shot.prompt_override || '').trim() && (!hasCast || shot.locked === true)) return shot.prompt_override;
+        var mode = detectMode(shot, project);
         var plan = planText(shot);
         var sound = String(shot.soundscape || '').trim() || 'N/A';
         var music = String(shot.music || '').trim() || 'N/A';
-        if (mode === 'ref2va' || (mode === 'continue' && shot.references.length)) {
-            var editing = shot.references.some(function (item) { return item.kind === 'video' && item.role === 'source_video'; });
+        if (mode === 'ref2va' || (mode === 'continue' && refs.length)) {
+            var editing = refs.some(function (item) { return item.kind === 'video' && item.role === 'source_video'; });
             var summary = String(shot.summary || '').trim() || ((editing ? '[video editing + reference generation] The target video is an edited version of <Video 1>. ' : '[reference generation] ') + String(shot.brief || ''));
-            return 'subject_definitions:\n' + refDefinitions(shot) +
+            return 'subject_definitions:\n' + refDefinitions(shot, refs, project) +
                 '\n\nsummary:\n' + summary +
-                '\n\nretention_analysis:\n' + refRetention(shot) +
+                '\n\nretention_analysis:\n' + refRetention(shot, refs, project) +
                 '\n\ndetailed_description:\n[Shot 1] ' + plan +
                 '\n\noverall_soundscape:\n' + sound +
                 '\n\nnon_diegetic_music:\n' + music;
@@ -664,20 +776,21 @@ var H3ProjectContracts = (function () {
         return '';
     }
 
-    function validateShot(shot) {
+    function validateShot(shot, project) {
         var seconds = Number(shot.duration_seconds);
         if (seconds < MIN_SECONDS || seconds > MAX_SECONDS) return 'Shot duration must stay between 5 and 15 seconds.';
         if (shot.width < 32 || shot.height < 32 || shot.width % 32 || shot.height % 32) return 'Shot dimensions must be positive multiples of 32.';
         if (shot.width * shot.height > MAX_PIXELS) return 'Shot resolution exceeds H3’s 24 GB product envelope.';
         if (!String(shot.brief || shot.shot_description || shot.prompt_override || '').trim()) return 'Write a shot brief or detailed shot plan before rendering.';
-        var mode = detectMode(shot);
-        var compliance = promptComplianceIssue(compilePrompt(shot), mode, seconds);
+        var mode = detectMode(shot, project);
+        var compliance = promptComplianceIssue(compilePrompt(shot, project), mode, seconds);
         if (compliance) return 'H3 prompt contract: ' + compliance;
         if (mode === 'continue' && String(shot.continue_from).indexOf('video-') !== 0) return 'Continuation source must be an H3 video job such as video-0100.';
-        if ((shot.references || []).length > 12) return 'H3 accepts at most 12 ordered references.';
+        var effRefs = effectiveReferences(shot, project);
+        if (effRefs.length > 12) return 'H3 accepts at most 12 ordered references (cast + shot). Trim the cast or shot references.';
         var counts = { image: 0, video: 0, audio: 0 }, durations = { video: 0, audio: 0 };
-        for (var i = 0; i < shot.references.length; i++) {
-            var item = shot.references[i];
+        for (var i = 0; i < effRefs.length; i++) {
+            var item = effRefs[i];
             if (!String(item.path || '').trim()) return 'Every ordered reference needs a server-uploaded file path.';
             counts[item.kind] = (counts[item.kind] || 0) + 1;
             if (item.kind === 'video' || item.kind === 'audio') {
@@ -692,13 +805,13 @@ var H3ProjectContracts = (function () {
         return '';
     }
 
-    function renderRequest(shot) {
-        var issue = validateShot(shot);
+    function renderRequest(shot, project) {
+        var issue = validateShot(shot, project);
         if (issue) throw new Error(issue);
-        var mode = detectMode(shot);
+        var mode = detectMode(shot, project);
         var request = {
             schema: 'serenity.h3.render.v1', model: 'minimax_h3', runner: 'minimax_h3_mojo_request',
-            task: mode, prompt: compilePrompt(shot), width: shot.width, height: shot.height,
+            task: mode, prompt: compilePrompt(shot, project), width: shot.width, height: shot.height,
             duration_seconds: Number(shot.duration_seconds), fps: NATIVE_FPS, frames: internalFrames(shot),
             output_frames: outputFrames(shot), steps: Number(shot.steps) || 20, seed: Number(shot.seed),
             include_audio: true, quant: shot.quant || 'int8-fast',
@@ -713,7 +826,8 @@ var H3ProjectContracts = (function () {
             request.motion_context_frames = Number(shot.motion_context_frames) || 22;
             request.trim_start_frames = request.motion_context_frames;
         }
-        if (shot.references.length) request.references = shot.references.map(copy);
+        var effRefs = effectiveReferences(shot, project);
+        if (effRefs.length) request.references = effRefs.map(copy);
         return request;
     }
 
@@ -971,6 +1085,10 @@ var H3ProjectContracts = (function () {
         createEmptyEndless: createEmptyEndless,
         createEndlessRun: createEndlessRun,
         normalizeProject: normalizeProject,
+        normalizeCharacter: normalizeCharacter,
+        castMembers: castMembers,
+        castReferences: castReferences,
+        effectiveReferences: effectiveReferences,
         copy: copy,
         secondsText: secondsText,
         projectKindLabel: projectKindLabel,

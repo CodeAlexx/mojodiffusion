@@ -26,7 +26,10 @@ var H3StudioTab = (function () {
         videoPollToken: 0,
         endlessPollToken: 0,
         endlessSubmitting: false,
-        modal: ''
+        modal: '',
+        library: null,
+        currentProjectId: '',
+        storyboardView: false
     };
 
     function escapeHtml(value) {
@@ -39,20 +42,109 @@ var H3StudioTab = (function () {
     function selected(value, expected) { return String(value) === String(expected) ? ' selected' : ''; }
     function disabled(value) { return value ? ' disabled' : ''; }
 
-    function loadProject() {
+    // Contained movie library: every project lives ONLY under this moviemaker key.
+    // Nothing here is shared with Generate, History, or the Queue.
+    var LIBRARY_KEY = 'serenity-h3-library-v1';
+
+    function newProjectId() {
+        return 'movie-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e9).toString(36);
+    }
+
+    function loadLibrary() {
         try {
-            var raw = localStorage.getItem(STORAGE_KEY);
-            if (raw) return C.normalizeProject(JSON.parse(raw));
-        } catch (error) {
-            console.warn('[H3Studio] project restore failed:', error);
-        }
-        return C.createProject();
+            var raw = localStorage.getItem(LIBRARY_KEY);
+            if (raw) {
+                var lib = JSON.parse(raw);
+                if (lib && lib.projects && typeof lib.projects === 'object') {
+                    Object.keys(lib.projects).forEach(function (id) {
+                        try { lib.projects[id] = C.normalizeProject(lib.projects[id]); }
+                        catch (e) { delete lib.projects[id]; }
+                    });
+                    if (Object.keys(lib.projects).length) {
+                        if (!lib.projects[lib.current_id]) lib.current_id = Object.keys(lib.projects)[0];
+                        return lib;
+                    }
+                }
+            }
+        } catch (error) { console.warn('[H3Studio] library restore failed:', error); }
+        // Migrate a legacy single project if present, else seed a fresh one.
+        var seed = null;
+        try { var old = localStorage.getItem(STORAGE_KEY); if (old) seed = C.normalizeProject(JSON.parse(old)); }
+        catch (e) { seed = null; }
+        if (!seed) seed = C.createProject();
+        var id = newProjectId();
+        var fresh = { schema: 'serenity.h3.library.v1', current_id: id, projects: {} };
+        fresh.projects[id] = seed;
+        try { localStorage.setItem(LIBRARY_KEY, JSON.stringify(fresh)); } catch (e) {}
+        return fresh;
+    }
+
+    function saveLibrary() {
+        try { localStorage.setItem(LIBRARY_KEY, JSON.stringify(state.library)); } catch (e) {}
+    }
+
+    function loadProject() {
+        state.library = loadLibrary();
+        state.currentProjectId = state.library.current_id;
+        return state.library.projects[state.currentProjectId];
     }
 
     function saveProject(message) {
         state.project.updated_at = new Date().toISOString();
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state.project));
+        if (!state.library) state.library = { schema: 'serenity.h3.library.v1', current_id: '', projects: {} };
+        if (!state.currentProjectId) state.currentProjectId = state.library.current_id || newProjectId();
+        state.library.current_id = state.currentProjectId;
+        state.library.projects[state.currentProjectId] = state.project;
+        saveLibrary();
+        scheduleServerSave(state.currentProjectId, state.project);
         if (message) setStatus(message, '');
+    }
+
+    // Server-backed movie store (scoped to <out_dir>/movies/) — this is what makes a
+    // movie visible in ANY browser instead of trapped in one browser's localStorage.
+    var serverSaveTimers = {};
+    function scheduleServerSave(id, project) {
+        if (!id) return;
+        if (serverSaveTimers[id]) clearTimeout(serverSaveTimers[id]);
+        var body = JSON.stringify(project);
+        serverSaveTimers[id] = setTimeout(function () {
+            fetch('/v1/h3/projects/' + encodeURIComponent(id), {
+                method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: body
+            }).catch(function () {});
+        }, 500);
+    }
+    function deleteServerProject(id) {
+        if (!id) return;
+        fetch('/v1/h3/projects/' + encodeURIComponent(id), { method: 'DELETE' }).catch(function () {});
+    }
+    function pullServerProjects() {
+        fetch('/v1/h3/projects', { cache: 'no-store' })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) {
+                if (!data || !Array.isArray(data.projects) || !data.projects.length) return;
+                var added = false;
+                data.projects.forEach(function (entry) {
+                    if (!entry || !entry.id) return;
+                    var proj; try { proj = C.normalizeProject(entry.project); } catch (e) { return; }
+                    state.library.projects[entry.id] = proj;
+                    added = true;
+                });
+                if (added) {
+                    function hasTakes(p) { return p && p.shots.some(function (s) { return s.take_job_ids.length; }); }
+                    var current = state.library.projects[state.currentProjectId];
+                    // If the user is sitting on an untouched empty movie, jump them to a real one that has rendered content.
+                    if (!hasTakes(current)) {
+                        var withContent = Object.keys(state.library.projects).find(function (id) { return hasTakes(state.library.projects[id]); });
+                        if (withContent) { state.currentProjectId = withContent; state.project = state.library.projects[withContent]; state.selectedShotId = state.project.shots[0].id; }
+                    }
+                    if (!state.library.projects[state.currentProjectId]) { state.currentProjectId = Object.keys(state.library.projects)[0]; state.selectedShotId = 0; }
+                    // Point the live view at the freshly pulled project so newly-rendered takes actually show.
+                    state.project = state.library.projects[state.currentProjectId];
+                    if (!state.project.shots.some(function (s) { return s.id === state.selectedShotId; })) state.selectedShotId = state.project.shots[0].id;
+                    state.library.current_id = state.currentProjectId;
+                    saveLibrary(); render();
+                }
+            }).catch(function () {});
     }
 
     function showToast(message, tone) {
@@ -134,11 +226,25 @@ var H3StudioTab = (function () {
             '<span class="h3s-chip ' + (ready ? 'is-ready' : 'is-blocked') + '">' + (ready ? 'Runtime ready' : 'Runtime unavailable') + '</span>' +
             '</div>' +
             '<div class="h3s-header-actions">' +
+            projectPickerHtml() +
             '<button class="h3s-btn is-quiet" data-h3-action="new-project">New</button>' +
             '<button class="h3s-btn is-quiet" data-h3-action="import-project">Import</button>' +
+            '<button class="h3s-btn is-quiet" data-h3-action="delete-project">Delete movie</button>' +
             '<button class="h3s-btn" data-h3-action="export-project">Export project</button>' +
             '<button class="h3s-btn" data-h3-action="export-edit">Export edit</button>' +
             '</div></header>';
+    }
+
+    function projectPickerHtml() {
+        if (!state.library || !state.library.projects) return '';
+        var ids = Object.keys(state.library.projects);
+        var opts = ids.map(function (id) {
+            var p = state.library.projects[id];
+            var n = p.shots ? p.shots.length : 0;
+            var label = (p.title || 'Untitled') + ' · ' + n + ' shot' + (n === 1 ? '' : 's');
+            return '<option value="' + attr(id) + '"' + selected(id, state.currentProjectId) + '>' + escapeHtml(label) + '</option>';
+        }).join('');
+        return '<label class="h3s-project-open"><span>Movie</span><select id="h3s-project-picker" class="h3s-input" title="Open a movie from this library">' + opts + '</select></label>';
     }
 
     function projectControlsHtml() {
@@ -156,18 +262,42 @@ var H3StudioTab = (function () {
 
     function biblesHtml() {
         var tabs = [
-            ['director_brief', 'Director'], ['continuity_bible', 'Continuity'], ['brand_bible', 'Brand']
+            ['director_brief', 'Director'], ['continuity_bible', 'Continuity'], ['cast', 'Cast'], ['brand_bible', 'Brand']
         ];
         var placeholder = state.bibleTab === 'director_brief'
             ? 'Movie outline, script, commercial brief, dialogue, or general story intent…'
             : (state.bibleTab === 'continuity_bible'
                 ? 'Identity, wardrobe, props, location, lighting, eyeline, screen direction, motion, dialogue and sound state…'
                 : 'Product, logo, visual language, claims, colors, typography, audience and mandatory brand beats…');
+        var body = state.bibleTab === 'cast'
+            ? castEditorHtml()
+            : '<label class="h3s-field" style="margin-top:8px"><textarea class="h3s-textarea" data-project-field="' + state.bibleTab + '" placeholder="' + attr(placeholder) + '">' + escapeHtml(state.project[state.bibleTab] || '') + '</textarea></label>';
         return '<div class="h3s-section"><div class="h3s-section-head"><span class="h3s-kicker">Project bibles</span><span class="h3s-count">AUTOSAVED</span></div>' +
             '<div class="h3s-bible-tabs">' + tabs.map(function (tab) {
                 return '<button class="h3s-tab ' + (state.bibleTab === tab[0] ? 'is-active' : '') + '" data-bible-tab="' + tab[0] + '">' + tab[1] + '</button>';
-            }).join('') + '</div>' +
-            '<label class="h3s-field" style="margin-top:8px"><textarea class="h3s-textarea" data-project-field="' + state.bibleTab + '" placeholder="' + attr(placeholder) + '">' + escapeHtml(state.project[state.bibleTab] || '') + '</textarea></label></div>';
+            }).join('') + '</div>' + body + '</div>';
+    }
+
+    function castEditorHtml() {
+        var chars = state.project.characters || [];
+        var cards = chars.map(function (c, i) {
+            var thumbSrc = String(c.ref_url || c.ref_path || '').trim();
+            var thumb = thumbSrc
+                ? '<img class="h3s-cast-thumb" src="' + attr(thumbSrc) + '" alt="' + attr(c.name) + '" onerror="this.style.opacity=0.2">'
+                : '<div class="h3s-cast-thumb is-empty">No image</div>';
+            return '<div class="h3s-cast-card">' + thumb +
+                '<div class="h3s-cast-body">' +
+                '<input class="h3s-input" data-cast-field="name" data-cast-index="' + i + '" value="' + attr(c.name) + '" placeholder="Character name (e.g. Marcus)">' +
+                '<textarea class="h3s-textarea is-cast" data-cast-field="appearance" data-cast-index="' + i + '" placeholder="Locked look: age, face, hair, skin tone, build, and the exact wardrobe worn across the whole film…">' + escapeHtml(c.appearance || '') + '</textarea>' +
+                '<div class="h3s-cast-actions"><button class="h3s-btn is-quiet" data-cast-image="' + i + '">' + (c.ref_path ? 'Replace portrait' : 'Set portrait') + '</button>' +
+                '<button class="h3s-btn is-quiet" data-cast-remove="' + i + '">Remove</button></div></div></div>';
+        }).join('');
+        return '<div class="h3s-cast">' +
+            '<div class="h3s-help" style="margin:8px 0">Every character here is auto-attached to every shot (same portrait + locked look), so faces and wardrobe stay identical across the movie. Locked shots keep their exact prompt.</div>' +
+            '<label class="h3s-check" style="margin:2px 0 6px"><input type="checkbox" data-project-field="cast_replaces_identities"' + checked(state.project.cast_replaces_identities !== false) + '><span>Cast is the only identity source — ignore each shot’s own per-shot people (removes the old drift). Turn off to also keep shot-specific guests.</span></label>' +
+            (cards || '<div class="h3s-cast-empty">No cast yet. Add the recurring people so they stop drifting between shots.</div>') +
+            '<button class="h3s-btn is-primary" data-h3-action="add-character" style="margin-top:8px">Add character</button>' +
+            '<input id="h3s-cast-image" type="file" accept="image/*" hidden></div>';
     }
 
     function shotListHtml() {
@@ -191,13 +321,74 @@ var H3StudioTab = (function () {
         var shot = selectedShot();
         var mode = C.detectMode(shot);
         var take = shot.selected_take >= 0 ? shot.take_output_paths[shot.selected_take] : '';
-        var src = take || shot.output_path || '';
+        var src = state.storyboardView ? '' : (take || shot.output_path || '');
         var content = src
             ? '<video controls preload="metadata" src="' + attr(src) + '"></video>'
-            : '<div class="h3s-monitor-empty"><div><div class="h3s-monitor-code">SHOT ' + String(selectedShotIndex() + 1).padStart(2, '0') + ' · ' + mode.toUpperCase() + '</div><div class="h3s-monitor-title">' + escapeHtml(shot.title) + '</div><div class="h3s-monitor-copy">' + escapeHtml(shot.brief || shot.shot_description || 'Write the beat, stage the references, then prepare or render this shot. No GPU work begins until Queue H3 take is confirmed.') + '</div></div></div>';
+            : (shot.storyboard_image
+                ? '<img class="h3s-monitor-still" src="' + attr(shot.storyboard_image) + '" alt="storyboard frame"><div class="h3s-monitor-storytag">STORYBOARD · SHOT ' + String(selectedShotIndex() + 1).padStart(2, '0') + ' · ' + escapeHtml(shot.title) + '</div>'
+                : '<div class="h3s-monitor-empty"><div><div class="h3s-monitor-code">SHOT ' + String(selectedShotIndex() + 1).padStart(2, '0') + ' · ' + mode.toUpperCase() + '</div><div class="h3s-monitor-title">' + escapeHtml(shot.title) + '</div><div class="h3s-monitor-copy">' + escapeHtml(shot.brief || shot.shot_description || 'Write the beat, stage the references, then prepare or render this shot. No GPU work begins until Queue H3 take is confirmed.') + '</div></div></div>');
+        var transportBar = '<div class="h3s-transport">' +
+            '<button class="h3s-tbtn" data-transport="rewind" title="Rewind to start">⏮</button>' +
+            '<button class="h3s-tbtn" data-transport="play" title="Play">▶</button>' +
+            '<button class="h3s-tbtn" data-transport="pause" title="Pause">⏸</button>' +
+            '<button class="h3s-tbtn" data-transport="stop" title="Stop">⏹</button>' +
+            '<button class="h3s-tbtn is-wide" data-transport="playcut" title="Play the whole cut in order">▶ Play cut</button>' +
+            '<span class="h3s-transport-spacer"></span>' +
+            '<button class="h3s-tbtn is-wide' + (state.storyboardView ? ' is-on' : '') + '" data-transport="toggleview" title="Switch between storyboard stills and the rendered video">' + (state.storyboardView ? '🎬 Show video' : '🖼 Show storyboard') + '</button>' +
+            '</div>';
         return '<div class="h3s-monitor-wrap"><div class="h3s-monitor">' + content + '<div class="h3s-monitor-bars"></div>' +
             '<span class="h3s-safe-corner tl"></span><span class="h3s-safe-corner tr"></span><span class="h3s-safe-corner bl"></span><span class="h3s-safe-corner br"></span>' +
-            '<div class="h3s-monitor-hud"><span>' + shot.width + '×' + shot.height + ' · ' + C.secondsText(shot.duration_seconds) + 's</span><span>H3 NATIVE 24 FPS · SYNC AUDIO</span></div></div></div>';
+            '<div class="h3s-monitor-hud"><span>' + shot.width + '×' + shot.height + ' · ' + C.secondsText(shot.duration_seconds) + 's</span><span>H3 NATIVE 24 FPS · SYNC AUDIO</span></div></div>' + transportBar + '</div>';
+    }
+
+    function monitorVideo() { return document.querySelector('#panel-h3-studio .h3s-monitor video'); }
+    function transport(action) {
+        if (action === 'toggleview') { state.animaticToken = (state.animaticToken || 0) + 1; state.storyboardView = !state.storyboardView; render(); return; }
+        if (action === 'playcut') { if (state.storyboardView) playStoryboard(); else playCut(); return; }
+        if (state.storyboardView) {
+            // Storyboard mode: play/rewind = animatic slideshow; pause/stop = cancel it.
+            if (action === 'play' || action === 'rewind') playStoryboard();
+            else if (action === 'pause' || action === 'stop') { state.animaticToken = (state.animaticToken || 0) + 1; setStatus('Storyboard preview stopped', ''); }
+            return;
+        }
+        var v = monitorVideo();
+        if (!v) { showToast('This shot has no rendered take yet — render it or switch to a rendered shot', 'error'); return; }
+        if (action === 'play') v.play();
+        else if (action === 'pause') v.pause();
+        else if (action === 'rewind') { v.currentTime = 0; v.play(); }
+        else if (action === 'stop') { v.pause(); v.currentTime = 0; }
+    }
+    function playStoryboard() {
+        var shots = state.project.shots;
+        if (!shots.length) return;
+        if (!state.storyboardView) { state.storyboardView = true; }
+        var i = 0;
+        state.animaticToken = (state.animaticToken || 0) + 1;
+        var token = state.animaticToken;
+        function step() {
+            if (token !== state.animaticToken) return;           // cancelled by pause/stop/toggle
+            if (i >= shots.length) { setStatus('Storyboard preview finished', ''); return; }
+            state.selectedShotId = shots[i].id; render();
+            var seconds = Math.max(1, Number(shots[i].duration_seconds) || 5);
+            i++;
+            setTimeout(step, seconds * 1000);
+        }
+        setStatus('Playing storyboard preview (' + shots.length + ' stills)', 'live');
+        step();
+    }
+    function playCut() {
+        var urls = state.project.shots.map(function (s) { return s.selected_take >= 0 ? s.take_output_paths[s.selected_take] : ''; }).filter(Boolean);
+        if (!urls.length) { showToast('No rendered shots to play yet', 'error'); return; }
+        if (state.storyboardView) { state.storyboardView = false; }
+        var firstIdx = state.project.shots.findIndex(function (s) { return s.selected_take >= 0 && s.take_output_paths[s.selected_take]; });
+        if (firstIdx >= 0) { state.selectedShotId = state.project.shots[firstIdx].id; render(); }
+        var v = monitorVideo();
+        if (!v) return;
+        var i = 0;
+        function playIdx(k) { v.src = urls[k]; v.currentTime = 0; v.play(); }
+        v.onended = function () { i++; if (i < urls.length) playIdx(i); };
+        playIdx(0);
+        setStatus('Playing the full cut (' + urls.length + ' shots)', 'live');
     }
 
     function briefStageHtml() {
@@ -214,8 +405,8 @@ var H3StudioTab = (function () {
 
     function promptStageHtml() {
         var shot = selectedShot();
-        var prompt = C.compilePrompt(shot);
-        var issue = C.promptComplianceIssue(prompt, C.detectMode(shot), shot.duration_seconds);
+        var prompt = C.compilePrompt(shot, state.project);
+        var issue = C.promptComplianceIssue(prompt, C.detectMode(shot, state.project), shot.duration_seconds);
         return '<div class="h3s-panel-head"><div><div class="h3s-kicker">Canonical H3 prompt</div><div class="h3s-stage-copy" style="margin:4px 0 0">Advanced override. Clear the override to compile from shot fields again.</div></div>' +
             '<button class="h3s-btn" data-h3-action="compile-prompt">Compile fields</button></div>' +
             (issue ? '<div class="h3s-warning h3s-error">' + escapeHtml(issue) + '</div>' : '<div class="h3s-warning" style="border-color:rgba(126,175,120,.35);background:rgba(126,175,120,.08);color:#a7c8a2">Prompt structure passes the local H3 contract.</div>') +
@@ -352,12 +543,32 @@ var H3StudioTab = (function () {
     function timelineHtml() {
         var cumulative = 0;
         var rows = [];
+        var count = state.project.shots.length;
         state.project.shots.forEach(function (shot, index) {
             if (index) rows.push('<span class="h3s-spine-join"></span>');
             var start = cumulative; cumulative += Number(shot.duration_seconds || 0);
-            rows.push('<button class="h3s-spine-shot ' + (shot.id === state.selectedShotId ? 'is-active ' : '') + (shot.locked ? 'is-locked' : '') + '" data-select-shot="' + shot.id + '"><div class="h3s-spine-title">' + escapeHtml(shot.title) + '</div><div class="h3s-spine-meta">' + timecode(start) + ' → ' + timecode(cumulative) + '</div><div class="h3s-spine-meta">' + C.detectMode(shot).toUpperCase() + ' · ' + shot.take_job_ids.length + ' TAKE(S)</div></button>');
+            var takePath = (!state.storyboardView && shot.selected_take >= 0) ? shot.take_output_paths[shot.selected_take] : '';
+            var thumb = takePath
+                ? '<video class="h3s-spine-thumb" src="' + attr(takePath) + '#t=0.4" muted preload="metadata" playsinline></video>'
+                : (shot.storyboard_image
+                    ? '<img class="h3s-spine-thumb" src="' + attr(shot.storyboard_image) + '" alt="">'
+                    : '<div class="h3s-spine-thumb is-empty">' + String(index + 1).padStart(2, '0') + '</div>');
+            rows.push(
+                '<div class="h3s-spine-shot ' + (shot.id === state.selectedShotId ? 'is-active ' : '') + (shot.locked ? 'is-locked' : '') + '" data-select-shot="' + shot.id + '" role="button" tabindex="0">' +
+                thumb +
+                '<div class="h3s-spine-body">' +
+                '<div class="h3s-spine-title">' + escapeHtml(shot.title) + '</div>' +
+                '<div class="h3s-spine-meta">' + timecode(start) + ' → ' + timecode(cumulative) + '</div>' +
+                '<div class="h3s-spine-meta">' + C.detectMode(shot).toUpperCase() + ' · ' + shot.take_job_ids.length + ' TAKE(S)</div>' +
+                '</div>' +
+                '<div class="h3s-spine-controls">' +
+                '<button class="h3s-spine-btn" data-spine-move="-1" data-spine-shot="' + shot.id + '" title="Move earlier"' + disabled(index === 0) + '>◀</button>' +
+                '<button class="h3s-spine-btn" data-spine-move="1" data-spine-shot="' + shot.id + '" title="Move later"' + disabled(index === count - 1) + '>▶</button>' +
+                '<button class="h3s-spine-btn is-danger" data-spine-del="1" data-spine-shot="' + shot.id + '" title="Delete this shot"' + disabled(count <= 1) + '>✕</button>' +
+                '</div>' +
+                '</div>');
         });
-        return '<section class="h3s-timeline"><div class="h3s-timeline-head"><span class="h3s-kicker">Continuity spine</span><span class="h3s-timecode">' + timecode(totalSeconds()) + ' · DELIVERY ' + state.project.delivery_fps + ' FPS</span></div><div class="h3s-spine">' + rows.join('') + '</div></section>';
+        return '<section class="h3s-timeline"><div class="h3s-spine-resize" data-spine-resize title="Drag up/down to resize the spine"></div><div class="h3s-timeline-head"><span class="h3s-kicker">Continuity spine' + (state.storyboardView ? ' · STORYBOARD' : '') + '</span><span class="h3s-timecode">' + timecode(totalSeconds()) + ' · DELIVERY ' + state.project.delivery_fps + ' FPS</span></div><div class="h3s-spine">' + rows.join('') + '</div></section>';
     }
 
     function statusHtml() {
@@ -424,6 +635,30 @@ var H3StudioTab = (function () {
         panel.querySelectorAll('[data-select-shot]').forEach(function (node) {
             node.addEventListener('click', function () { state.selectedShotId = Number(node.dataset.selectShot); state.requestJson = ''; render(); });
         });
+        panel.querySelectorAll('[data-spine-move]').forEach(function (node) {
+            node.addEventListener('click', function (event) { event.stopPropagation(); state.selectedShotId = Number(node.dataset.spineShot); moveShot(Number(node.dataset.spineMove)); });
+        });
+        panel.querySelectorAll('[data-spine-del]').forEach(function (node) {
+            node.addEventListener('click', function (event) { event.stopPropagation(); state.selectedShotId = Number(node.dataset.spineShot); deleteShot(); });
+        });
+        panel.querySelectorAll('[data-transport]').forEach(function (node) {
+            node.addEventListener('click', function () { transport(node.dataset.transport); });
+        });
+        var spineResize = panel.querySelector('[data-spine-resize]');
+        if (spineResize) spineResize.addEventListener('mousedown', function (e) {
+            e.preventDefault();
+            var startY = e.clientY;
+            var startH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--h3-spine-h')) || 158;
+            function move(ev) {
+                var h = Math.max(120, Math.min(680, startH + (startY - ev.clientY)));
+                document.documentElement.style.setProperty('--h3-spine-h', h + 'px');
+            }
+            function up() {
+                document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up);
+                try { localStorage.setItem('serenity-h3-spine-h', document.documentElement.style.getPropertyValue('--h3-spine-h')); } catch (err) {}
+            }
+            document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
+        });
         panel.querySelectorAll('[data-stage-tab]').forEach(function (node) { node.addEventListener('click', function () { state.stageTab = node.dataset.stageTab; render(); }); });
         panel.querySelectorAll('[data-inspector-tab]').forEach(function (node) { node.addEventListener('click', function () { state.inspectorTab = node.dataset.inspectorTab; render(); }); });
         panel.querySelectorAll('[data-bible-tab]').forEach(function (node) { node.addEventListener('click', function () { state.bibleTab = node.dataset.bibleTab; render(); }); });
@@ -457,7 +692,19 @@ var H3StudioTab = (function () {
         panel.querySelectorAll('[data-ref-move]').forEach(function (node) { node.addEventListener('click', function () { moveReference(Number(node.dataset.refIndex), Number(node.dataset.refMove)); }); });
         panel.querySelectorAll('[data-ref-remove]').forEach(function (node) { node.addEventListener('click', function () { if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base references are immutable during the active run.', 'error'); return; } selectedShot().references.splice(Number(node.dataset.refRemove), 1); selectedShot().prompt_override = ''; saveProject(); render(); }); });
         panel.querySelectorAll('[data-asset-remove]').forEach(function (node) { node.addEventListener('click', function () { state.project.assets.splice(Number(node.dataset.assetRemove), 1); saveProject(); render(); }); });
+        panel.querySelectorAll('[data-cast-field]').forEach(function (node) {
+            node.addEventListener('input', function () {
+                var c = (state.project.characters || [])[Number(node.dataset.castIndex)];
+                if (c) { c[node.dataset.castField] = node.value; saveProject(); }
+            });
+        });
+        panel.querySelectorAll('[data-cast-remove]').forEach(function (node) { node.addEventListener('click', function () { (state.project.characters || []).splice(Number(node.dataset.castRemove), 1); saveProject(); render(); }); });
+        var castImageInput = document.getElementById('h3s-cast-image');
+        panel.querySelectorAll('[data-cast-image]').forEach(function (node) { node.addEventListener('click', function () { if (castImageInput) { castImageInput.dataset.castIndex = node.dataset.castImage; castImageInput.click(); } }); });
+        if (castImageInput) castImageInput.addEventListener('change', function () { uploadCastImage(Number(castImageInput.dataset.castIndex), castImageInput.files[0]); castImageInput.value = ''; });
         panel.querySelectorAll('[data-h3-action]').forEach(function (node) { node.addEventListener('click', function () { handleAction(node.dataset.h3Action); }); });
+        var projectPicker = document.getElementById('h3s-project-picker');
+        if (projectPicker) projectPicker.addEventListener('change', function () { openProject(projectPicker.value); });
         var projectTitle = document.getElementById('h3s-project-title');
         if (projectTitle) projectTitle.addEventListener('input', function () { state.project.title = projectTitle.value; saveProject(); });
         var resolution = document.getElementById('h3s-resolution');
@@ -529,8 +776,27 @@ var H3StudioTab = (function () {
         }).catch(function (error) { setStatus('Asset upload failed: ' + error.message, 'error'); });
     }
 
+    function addCharacter() {
+        if (!Array.isArray(state.project.characters)) state.project.characters = [];
+        if (!state.project.next_character_id) state.project.next_character_id = 1;
+        state.project.characters.push({ id: state.project.next_character_id++, name: '', ref_path: '', ref_url: '', appearance: '' });
+        state.bibleTab = 'cast'; saveProject('Character added'); render();
+    }
+
+    function uploadCastImage(index, file) {
+        if (!file) return;
+        setStatus('Uploading portrait…', 'live');
+        SerenityAPI.uploadMediaDetails(file).then(function (data) {
+            var c = (state.project.characters || [])[index];
+            if (c) { c.ref_path = data.path || data.name || ''; c.ref_url = data.url || data.path || ''; }
+            saveProject('Portrait set'); setStatus('Portrait set', ''); render();
+        }).catch(function (error) { setStatus('Portrait upload failed: ' + error.message, 'error'); });
+    }
+
     function handleAction(action) {
         if (action === 'new-project') newProject();
+        else if (action === 'add-character') addCharacter();
+        else if (action === 'delete-project') deleteProject();
         else if (action === 'import-project') document.getElementById('h3s-project-import').click();
         else if (action === 'export-project') downloadJson(safeName(state.project.title) + '.serenitymovie.json', state.project);
         else if (action === 'export-edit') downloadJson(safeName(state.project.title) + '.serenityedit.json', C.deliveryManifest(state.project));
@@ -561,8 +827,39 @@ var H3StudioTab = (function () {
         if (['submitting', 'running', 'stopping'].indexOf(endlessState().status) >= 0) {
             showToast('Stop the active endless story before replacing this project', 'error'); return;
         }
-        if (!window.confirm('Create a new H3 project? Export the current project first if you need a file copy.')) return;
-        state.project = C.createProject(); state.selectedShotId = 1; state.requestJson = ''; saveProject('New movie project created'); render();
+        if (!window.confirm('Start a new movie? Your current movie stays saved in this library.')) return;
+        var id = newProjectId();
+        state.currentProjectId = id;
+        state.project = C.createProject();
+        state.library.projects[id] = state.project;
+        state.library.current_id = id;
+        state.selectedShotId = state.project.shots[0].id; state.requestJson = '';
+        saveProject('New movie started'); render();
+    }
+
+    function openProject(id) {
+        if (!id || !state.library || !state.library.projects[id]) return;
+        state.currentProjectId = id;
+        state.library.current_id = id;
+        state.project = state.library.projects[id];
+        state.selectedShotId = state.project.shots[0].id;
+        state.requestJson = '';
+        saveProject('Opened “' + (state.project.title || 'movie') + '”'); render();
+    }
+
+    function deleteProject() {
+        var ids = state.library ? Object.keys(state.library.projects) : [];
+        if (ids.length <= 1) { setStatus('Keep at least one movie in the library', 'error'); showToast('This is your only movie — start another before deleting it', 'error'); return; }
+        if (!window.confirm('Delete the movie “' + (state.project.title || 'Untitled') + '” from this library? This cannot be undone.')) return;
+        var deletedId = state.currentProjectId;
+        deleteServerProject(deletedId);
+        delete state.library.projects[state.currentProjectId];
+        var next = Object.keys(state.library.projects)[0];
+        state.currentProjectId = next;
+        state.library.current_id = next;
+        state.project = state.library.projects[next];
+        state.selectedShotId = state.project.shots[0].id;
+        saveProject('Movie deleted'); render();
     }
     function addShot() {
         var id = state.project.next_shot_id++; var shot = C.createShot(id, 'Shot ' + (state.project.shots.length + 1));
@@ -672,8 +969,16 @@ var H3StudioTab = (function () {
         if (['submitting', 'running', 'stopping'].indexOf(endlessState().status) >= 0) {
             showToast('Stop the active endless story before importing another project', 'error'); return;
         }
-        file.text().then(function (text) { var project = C.normalizeProject(JSON.parse(text)); state.project = project; state.selectedShotId = project.shots[0].id; state.requestJson = ''; saveProject('Project imported'); render(); })
-            .catch(function (error) { setStatus('Project import failed: ' + error.message, 'error'); });
+        file.text().then(function (text) {
+            var project = C.normalizeProject(JSON.parse(text));
+            var id = newProjectId();
+            state.currentProjectId = id;
+            state.library.projects[id] = project;
+            state.library.current_id = id;
+            state.project = project;
+            state.selectedShotId = project.shots[0].id; state.requestJson = '';
+            saveProject('Imported “' + (project.title || 'movie') + '”'); render();
+        }).catch(function (error) { setStatus('Project import failed: ' + error.message, 'error'); });
     }
 
     function selectedTakeDone() {
@@ -958,13 +1263,15 @@ var H3StudioTab = (function () {
             if (shot.attention_backend !== resolvedAttention) {
                 requestShot = C.copy(shot); requestShot.attention_backend = resolvedAttention;
             }
-            var request = C.renderRequest(requestShot);
+            var request = C.renderRequest(requestShot, state.project);
+            request.project_id = state.currentProjectId;
+            request.project_title = state.project.title;
             if (!window.confirm('Queue one ' + C.secondsText(shot.duration_seconds) + '-second H3 take at ' + shot.width + '×' + shot.height + '? This starts GPU work.')) return;
             setStatus('Submitting H3 take…', 'live');
             SerenityAPI.postVideo(request).then(function (job) {
                 if (!job || !(job.video_id || job.prompt_id)) throw new Error('server did not return a video job id');
                 var id = String(job.video_id || job.prompt_id); shot.take_job_ids.push(id); shot.take_states.push('queued'); shot.take_output_paths.push(''); shot.selected_take = shot.take_job_ids.length - 1; shot.status = 'Queued'; saveProject();
-                if (typeof QueueTab !== 'undefined') { QueueTab.init(); QueueTab.registerPending({ promptId: id, prompt: shot.brief || shot.shot_description, model: 'MiniMax H3', queuedAt: Date.now(), batchLabel: state.project.title + ' · ' + shot.title }); }
+                // Contained moviemaker: takes stay in THIS project's shot deck only — never registered in the global Queue tab, so nothing spills into the rest of the app.
                 setStatus('Queued ' + id + ' · waiting for H3 runtime', 'live'); render(); pollVideo(job, shot.id);
             }).catch(function (error) { setStatus('H3 submission failed: ' + error.message, 'error'); showToast('H3 submission failed: ' + error.message, 'error'); });
         } catch (error) { setStatus(error.message, 'error'); showToast(error.message, 'error'); }
@@ -1013,7 +1320,8 @@ var H3StudioTab = (function () {
     function init() {
         if (state.initialized) return;
         state.initialized = true; state.project = loadProject(); state.selectedShotId = state.project.shots[0].id;
-        render(); loadReadiness(); resumeEndless();
+        try { var sh = localStorage.getItem('serenity-h3-spine-h'); if (sh) document.documentElement.style.setProperty('--h3-spine-h', sh.trim()); } catch (e) {}
+        render(); loadReadiness(); resumeEndless(); pullServerProjects();
     }
 
     return { init: init, render: render, state: state, contracts: C };

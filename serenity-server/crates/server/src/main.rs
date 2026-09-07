@@ -49,7 +49,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -66,6 +66,7 @@ mod comfy;
 mod gallery;
 mod gpu_lock;
 mod grid;
+mod h3_projects;
 mod jobs;
 mod magic;
 mod models;
@@ -4621,6 +4622,15 @@ fn max_existing_output_id(out_dir: &FsPath) -> u64 {
     let mut max_seen = 0;
     scan(out_dir, &mut max_seen);
     scan(&out_dir.join("uploads"), &mut max_seen);
+    // Per-movie H3 folders store video-NNNN under movies/<project>/, so scan each
+    // to avoid reissuing an id that would overwrite an existing shot after restart.
+    if let Ok(movies) = std::fs::read_dir(out_dir.join("movies")) {
+        for movie in movies.flatten() {
+            if movie.path().is_dir() {
+                scan(&movie.path(), &mut max_seen);
+            }
+        }
+    }
     max_seen
 }
 
@@ -5838,6 +5848,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/enhance_prompt", post(magic::post_enhance_prompt))
         .route("/v1/caption", post(caption::post_caption))
         .route("/v1/h3/director", post(caption::post_h3_director))
+        .route("/v1/h3/projects", get(h3_projects::get_projects))
+        .route(
+            "/v1/h3/projects/:id",
+            put(h3_projects::put_project).delete(h3_projects::delete_project),
+        )
         .route("/v1/jobs", get(jobs::get_jobs))
         .route(
             "/v1/history/artifacts",

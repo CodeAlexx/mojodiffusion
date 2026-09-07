@@ -14,6 +14,10 @@ pub(super) const MINIMAX_H3_REQUEST_RUNNER: &str = "output/bin/minimax_h3_sereni
 pub(super) const MINIMAX_H3_INT8_FAST_SHIM: &str = "output/lib/libserenity_minimax_h3_int8.so";
 pub(super) const MINIMAX_H3_PRODUCT_GATE: &str = "output/checks/minimax_h3_product_gate.json";
 pub(super) const MINIMAX_H3_MODEL_ROOT: &str = "checkpoints/MiniMax-H3/FL2VA";
+pub(super) const MINIMAX_H3_CONTROLNET_NAME: &str =
+    "MiniMax-H3-Fun-Controlnet-Union.safetensors";
+pub(super) const MINIMAX_H3_CONTROLNET_MODEL: &str =
+    "controlnets/MiniMax-H3-Fun-Controlnet-Union.safetensors";
 pub(super) const MINIMAX_H3_ENCODER_CACHE: &str =
     "checkpoints/MiniMax-H3/FL2VA/text_encoder/serenity_int8_rowscale_v1";
 pub(super) const MINIMAX_H3_CONDITIONING_CACHE: &str = "checkpoints/MiniMax-H3/FL2VA/serenity_runtime_cache_v1/conditioning_ff21f1ebd1c73098_int8_bf16_output.bin";
@@ -78,7 +82,7 @@ fn minimax_h3_warm_submit(
             .append(true)
             .open(repo_path("output/logs/minimax_h3_warm_worker.log"))?;
         let serve_err = serve_log.try_clone()?;
-        let mut cmd = minimax_h3_capped_command(&repo_path(runner));
+        let mut cmd = minimax_h3_warm_capped_command(&repo_path(runner));
         cmd.current_dir(repo_root())
             // H3's 16-GiB-GPU lane mirrors the 17.96-GiB W8A8 cache into
             // anonymous host RAM in bounded chunks before denoise. Use the
@@ -613,6 +617,45 @@ pub(super) struct MiniMaxH3ContinuationSource {
     pub(super) latent_path: std::path::PathBuf,
 }
 
+/// Per-movie output isolation. A moviemaker take carries a `project_id`, so it is
+/// stored under `<out_dir>/movies/<project>/<video_id>` and all its `/out/...`
+/// URLs share that prefix. Everything else (LTX2, Generate-tab video) carries no
+/// `project_id`, so `rel == video_id` — byte-identical to before.
+pub(super) fn minimax_h3_safe_segment(value: &str) -> String {
+    let cleaned: String = value
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "untitled".to_string()
+    } else {
+        trimmed
+    }
+}
+
+pub(super) fn minimax_h3_project_segment(body: &Value) -> Option<String> {
+    body.get("project_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(minimax_h3_safe_segment)
+}
+
+pub(super) fn minimax_h3_output_rel(body: &Value, video_id: &str) -> String {
+    match minimax_h3_project_segment(body) {
+        Some(project) => format!("movies/{project}/{video_id}"),
+        None => video_id.to_string(),
+    }
+}
+
 pub(super) fn minimax_h3_continuation_source(
     output_root: &std::path::Path,
     body: &Value,
@@ -625,7 +668,10 @@ pub(super) fn minimax_h3_continuation_source(
         .ok_or_else(|| {
             "MiniMax-H3 continue_from must be a local video job id such as video-0100".to_string()
         })?;
-    let source_dir = output_root.join(job_id);
+    let source_dir = match minimax_h3_project_segment(body) {
+        Some(project) => output_root.join("movies").join(project).join(job_id),
+        None => output_root.join(job_id),
+    };
     let result_path = source_dir.join("result.json");
     let result: Value = std::fs::read_to_string(&result_path)
         .map_err(|error| {
@@ -721,6 +767,131 @@ pub(super) struct MiniMaxH3ReferenceInput {
     pub(super) audio_use: String,
     pub(super) has_audio: bool,
     pub(super) duration: f64,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct MiniMaxH3ControlInput {
+    pub(super) path: std::path::PathBuf,
+    pub(super) preprocessor: String,
+    pub(super) resize_mode: String,
+    pub(super) canny_low: i64,
+    pub(super) canny_high: i64,
+    pub(super) strength: f64,
+    pub(super) start_percent: f64,
+    pub(super) end_percent: f64,
+    pub(super) source_path: Option<std::path::PathBuf>,
+    pub(super) mask_path: Option<std::path::PathBuf>,
+    pub(super) invert_mask: bool,
+}
+
+pub(super) fn minimax_h3_control_inputs(
+    body: &Value,
+) -> Result<Vec<MiniMaxH3ControlInput>, String> {
+    let rows = body
+        .get("controls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "MiniMax-H3 ControlNet controls must be an ordered array".to_string())?;
+    if !(1..=4).contains(&rows.len()) {
+        return Err("MiniMax-H3 ControlNet requires one through four controls".to_string());
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let label = format!("controls[{index}]");
+            let path = row
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("MiniMax-H3 {label}.path is required"))
+                .and_then(|raw| minimax_h3_reference_media_path(raw, &format!("{label}.path")))?;
+            let preprocessor = row
+                .get("preprocessor")
+                .and_then(Value::as_str)
+                .unwrap_or("prepared");
+            if !matches!(preprocessor, "prepared" | "canny") {
+                return Err(format!(
+                    "MiniMax-H3 {label}.preprocessor must be 'prepared' or 'canny'"
+                ));
+            }
+            let resize_mode = row
+                .get("resize_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("crop");
+            if !matches!(resize_mode, "crop" | "pad" | "stretch") {
+                return Err(format!(
+                    "MiniMax-H3 {label}.resize_mode must be 'crop', 'pad', or 'stretch'"
+                ));
+            }
+            let canny_low = row.get("canny_low").and_then(Value::as_i64).unwrap_or(100);
+            let canny_high = row
+                .get("canny_high")
+                .and_then(Value::as_i64)
+                .unwrap_or(200);
+            if !(0..=255).contains(&canny_low)
+                || !(0..=255).contains(&canny_high)
+                || canny_low >= canny_high
+            {
+                return Err(format!(
+                    "MiniMax-H3 {label} Canny thresholds must satisfy 0 <= low < high <= 255"
+                ));
+            }
+            let strength = row.get("strength").and_then(Value::as_f64).unwrap_or(1.0);
+            let start_percent = row
+                .get("start_percent")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let end_percent = row
+                .get("end_percent")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            if !strength.is_finite()
+                || !start_percent.is_finite()
+                || !end_percent.is_finite()
+                || !(0.0..=1.0).contains(&start_percent)
+                || !(start_percent..=1.0).contains(&end_percent)
+            {
+                return Err(format!(
+                    "MiniMax-H3 {label} requires finite strength and 0 <= start <= end <= 1"
+                ));
+            }
+            let source_raw = row
+                .get("source_path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let mask_raw = row
+                .get("mask_path")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if source_raw.is_some() != mask_raw.is_some() {
+                return Err(format!(
+                    "MiniMax-H3 {label} inpainting requires source_path and mask_path together"
+                ));
+            }
+            let source_path = source_raw
+                .map(|raw| minimax_h3_reference_media_path(raw, &format!("{label}.source_path")))
+                .transpose()?;
+            let mask_path = mask_raw
+                .map(|raw| minimax_h3_reference_media_path(raw, &format!("{label}.mask_path")))
+                .transpose()?;
+            Ok(MiniMaxH3ControlInput {
+                path,
+                preprocessor: preprocessor.to_string(),
+                resize_mode: resize_mode.to_string(),
+                canny_low,
+                canny_high,
+                strength,
+                start_percent,
+                end_percent,
+                source_path,
+                mask_path,
+                invert_mask: row
+                    .get("invert_mask")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
 }
 
 pub(super) fn minimax_h3_reference_media_path(
@@ -1336,6 +1507,15 @@ pub(super) fn minimax_h3_capped_command(runner: &std::path::Path) -> std::proces
     command
         .env("MEM_MAX", "24G")
         .env("MEM_HIGH", "infinity")
+/// The stdin-driven warm worker still needs the foreground scope wrapper:
+/// `mem_safe_runtime.sh` monitors its service in the background and therefore
+/// cannot forward a persistent stdin stream. Keep this helper isolated from
+/// one-shot H3 jobs; its 12-GiB cap is too small for the 18-GiB W8A8 tail.
+fn minimax_h3_warm_capped_command(runner: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(repo_path("scripts/mem_safe.sh"));
+    command
+        .env("MEM_MAX", "12G")
+        .env("MEM_HIGH", "12G")
         .env("SWAP_MAX", "2G")
         .arg(runner);
     if minimax_h3_low_vram_mode(minimax_h3_gpu_memory().as_ref()) {
@@ -1346,6 +1526,23 @@ pub(super) fn minimax_h3_capped_command(runner: &std::path::Path) -> std::proces
             )
             .env("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT", "100");
     }
+    command
+}
+
+/// H3's packed W8A8 tail is 18.0 GiB. A 12-GiB host cap evicts it while an
+/// evaluation is still traversing the file, forcing every denoise step to
+/// reread the entire tail (measured 58.22/64.33 s for consecutive S=3,147
+/// evaluations). The large-runtime wrapper is still hard-capped and protects
+/// a 16-GiB desktop reserve, but its flat 24-GiB band retains the immutable
+/// cache: the matching second evaluation is 4.18-4.42 s.
+pub(super) fn minimax_h3_capped_command(runner: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(repo_path("scripts/mem_safe_runtime.sh"));
+    command
+        .env("MEM_MAX", "24G")
+        .env("MEM_HIGH", "infinity")
+        .env("SWAP_MAX", "2G")
+        .env("DESKTOP_RESERVE", "16G")
+        .arg(runner);
     command
 }
 
@@ -1569,7 +1766,7 @@ pub(super) fn minimax_h3_progress_from_log(
 
 pub(super) fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
     let task = minimax_h3_task(body);
-    if !matches!(task, "t2va" | "continue") {
+    if !matches!(task, "t2va" | "continue" | "controlnet") {
         return validate_minimax_h3_conditioned_request(body, task);
     }
     let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
@@ -1614,6 +1811,49 @@ pub(super) fn validate_minimax_h3_request(body: &Value) -> Result<(), String> {
     if !matches!(step_cache, "exact" | "high") {
         return Err("MiniMax-H3 step_cache must be 'exact' or 'high'".to_string());
     }
+    if task == "controlnet" {
+        if step_cache != "exact" {
+            return Err("MiniMax-H3 ControlNet requires exact step cache".to_string());
+        }
+        let geometry = minimax_h3_runtime_geometry(body)?;
+        if geometry.fps != MINIMAX_H3_FPS
+            || geometry.duration < 5.0
+            || geometry.duration > MINIMAX_H3_TRAINED_MAX_SECONDS
+            || geometry.duration.fract() != 0.0
+        {
+            return Err(
+                "MiniMax-H3 ControlNet requires a whole 5 through 15 seconds at 24 FPS"
+                    .to_string(),
+            );
+        }
+        let selected = body
+            .get("controlnet")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if selected != MINIMAX_H3_CONTROLNET_NAME {
+            return Err(format!(
+                "MiniMax-H3 ControlNet requires the installed official {MINIMAX_H3_CONTROLNET_NAME}"
+            ));
+        }
+        let checkpoint = model_path(MINIMAX_H3_CONTROLNET_MODEL);
+        if !nonempty_file(&checkpoint) {
+            return Err(format!(
+                "MiniMax-H3 ControlNet checkpoint is missing: {}",
+                checkpoint.display()
+            ));
+        }
+        let _ = minimax_h3_control_inputs(body)?;
+        if body
+            .get("loras")
+            .and_then(Value::as_array)
+            .is_some_and(|rows| !rows.is_empty())
+        {
+            return Err(
+                "MiniMax-H3 native ControlNet currently requires the base model without LoRA overlays"
+                    .to_string(),
+            );
+        }
+    }
     if body.get("include_audio").and_then(Value::as_bool) == Some(false) {
         return Err("MiniMax-H3 always generates synchronized audio".to_string());
     }
@@ -1649,7 +1889,7 @@ pub(super) fn validate_minimax_h3_conditioned_request(
 ) -> Result<(), String> {
     if !matches!(task, "i2va" | "l2va" | "fl2va" | "ref2va") {
         return Err(
-            "MiniMax-H3 task must be 't2va', 'continue', 'i2va', 'l2va', 'fl2va', or 'ref2va'"
+            "MiniMax-H3 task must be 't2va', 'continue', 'controlnet', 'i2va', 'l2va', 'fl2va', or 'ref2va'"
                 .to_string(),
         );
     }
@@ -1716,7 +1956,7 @@ pub(super) fn start_minimax_h3_request(
     if minimax_h3_continue_with_references(body) {
         return start_minimax_h3_conditioned_request(st, body, gpu);
     }
-    if !matches!(task, "t2va" | "continue") {
+    if !matches!(task, "t2va" | "continue" | "controlnet") {
         return start_minimax_h3_conditioned_request(st, body, gpu);
     }
     let continuation_source = if task == "continue" {
@@ -1727,6 +1967,13 @@ pub(super) fn start_minimax_h3_request(
     } else {
         None
     };
+    let controls = if task == "controlnet" {
+        minimax_h3_control_inputs(body)
+            .expect("validated MiniMax-H3 ControlNet controls must resolve")
+    } else {
+        Vec::new()
+    };
+    let controlnet_path = model_path(MINIMAX_H3_CONTROLNET_MODEL);
     let geometry = minimax_h3_runtime_geometry(body)
         .expect("validated MiniMax-H3 request must resolve runtime geometry");
     let profile_id = format!(
@@ -1785,7 +2032,8 @@ pub(super) fn start_minimax_h3_request(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         + 1;
     let video_id = format!("video-{n:04}");
-    let out_dir = st.out_dir.join(&video_id);
+    let rel = minimax_h3_output_rel(body, &video_id);
+    let out_dir = st.out_dir.join(&rel);
     if let Err(error) = std::fs::create_dir_all(&out_dir) {
         return err_detail(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1854,6 +2102,7 @@ pub(super) fn start_minimax_h3_request(
 
     let bus = st.comfy_ws.clone();
     let thread_video_id = video_id.clone();
+    let thread_rel = rel.clone();
     let thread_out_dir = out_dir.clone();
     let thread_quant = quant.clone();
     let thread_attention = attention.clone();
@@ -1864,6 +2113,8 @@ pub(super) fn start_minimax_h3_request(
     let thread_prompt = prompt.clone();
     let thread_task = task.to_string();
     let thread_continuation_source = continuation_source.clone();
+    let thread_controls = controls.clone();
+    let thread_controlnet_path = controlnet_path.clone();
     std::thread::spawn(move || {
         let _gpu = gpu;
         let publish = |event: WorkerEvent| {
@@ -1910,6 +2161,8 @@ pub(super) fn start_minimax_h3_request(
             "Starting MiniMax-H3 {} {} DiT with {} attention and {} step cache",
             if thread_task == "continue" {
                 "native continuation"
+            } else if thread_task == "controlnet" {
+                "native ControlNet"
             } else {
                 "T2VA"
             },
@@ -1979,12 +2232,48 @@ pub(super) fn start_minimax_h3_request(
             runner_args.push(format!("--motion-context-frames={motion_context_frames}"));
             runner_args.push(format!("--trim-start-frames={trim_start_frames}"));
         }
+        if thread_task == "controlnet" {
+            runner_args.push(format!(
+                "--controlnet={}",
+                thread_controlnet_path.to_string_lossy()
+            ));
+            for control in &thread_controls {
+                runner_args.push(format!("--control-media={}", control.path.to_string_lossy()));
+                runner_args.push(format!("--control-preprocessor={}", control.preprocessor));
+                runner_args.push(format!("--control-resize={}", control.resize_mode));
+                runner_args.push(format!("--control-canny-low={}", control.canny_low));
+                runner_args.push(format!("--control-canny-high={}", control.canny_high));
+                runner_args.push(format!("--control-strength={}", control.strength));
+                runner_args.push(format!("--control-start={}", control.start_percent));
+                runner_args.push(format!("--control-end={}", control.end_percent));
+                runner_args.push(format!(
+                    "--control-source={}",
+                    control
+                        .source_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "-".to_string())
+                ));
+                runner_args.push(format!(
+                    "--control-mask={}",
+                    control
+                        .mask_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "-".to_string())
+                ));
+                runner_args.push(format!(
+                    "--control-invert-mask={}",
+                    if control.invert_mask { 1 } else { 0 }
+                ));
+            }
+        }
         if thread_prompt == MINIMAX_H3_TEST_PROMPT {
             runner_args.push("--runtime-cache-exact-product-prompt".to_string());
         }
         // Warm path: hand the job line to the resident --serve worker; the
         // worker re-points its stdout at this job's runner.log itself.
-        let warm = minimax_h3_warm_enabled();
+        let warm = minimax_h3_warm_enabled() && thread_task != "controlnet";
         let mut child_opt: Option<std::process::Child> = None;
         if warm {
             drop(log);
@@ -2223,7 +2512,7 @@ pub(super) fn start_minimax_h3_request(
                 "motion_context_url".to_string(),
                 json!(format!(
                     "/out/{}/motion_context.safetensors",
-                    thread_video_id
+                    thread_rel
                 )),
             );
             document.insert(
@@ -2248,7 +2537,7 @@ pub(super) fn start_minimax_h3_request(
             );
             document.insert(
                 "mp4_url".to_string(),
-                json!(format!("/out/{}/video.mp4", thread_video_id)),
+                json!(format!("/out/{}/video.mp4", thread_rel)),
             );
         }
         if let Some(document) = result.as_ref() {
@@ -2286,9 +2575,9 @@ pub(super) fn start_minimax_h3_request(
             "attention_backend": attention,
             "step_cache": step_cache,
             "state": "queued",
-            "status_url": format!("/out/{video_id}/status.json"),
-            "result_url": format!("/out/{video_id}/result.json"),
-            "request_url": format!("/out/{video_id}/request.json"),
+            "status_url": format!("/out/{rel}/status.json"),
+            "result_url": format!("/out/{rel}/result.json"),
+            "request_url": format!("/out/{rel}/request.json"),
             "continue_from": continuation_source.as_ref().map(|source| source.job_id.as_str()),
             "motion_context_frames": geometry.motion_context_frames,
         }),
@@ -2430,7 +2719,8 @@ pub(super) fn start_minimax_h3_conditioned_request(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         + 1;
     let video_id = format!("video-{n:04}");
-    let out_dir = st.out_dir.join(&video_id);
+    let rel = minimax_h3_output_rel(body, &video_id);
+    let out_dir = st.out_dir.join(&rel);
     if let Err(error) = std::fs::create_dir_all(&out_dir) {
         return err_detail(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2599,6 +2889,7 @@ pub(super) fn start_minimax_h3_conditioned_request(
 
     let bus = st.comfy_ws.clone();
     let thread_video_id = video_id.clone();
+    let thread_rel = rel.clone();
     let thread_out_dir = out_dir.clone();
     let thread_task = task.clone();
     let thread_quant = quant.clone();
@@ -3011,7 +3302,7 @@ pub(super) fn start_minimax_h3_conditioned_request(
             );
             document.insert(
                 "mp4_url".to_string(),
-                json!(format!("/out/{}/video.mp4", thread_video_id)),
+                json!(format!("/out/{}/video.mp4", thread_rel)),
             );
             document.insert("intermediates_cleaned".to_string(), json!(true));
             document.insert("motion_context_available".to_string(), json!(true));
@@ -3061,9 +3352,9 @@ pub(super) fn start_minimax_h3_conditioned_request(
             "attention_backend": attention,
             "step_cache": step_cache,
             "state": "queued",
-            "status_url": format!("/out/{video_id}/status.json"),
-            "result_url": format!("/out/{video_id}/result.json"),
-            "request_url": format!("/out/{video_id}/request.json"),
+            "status_url": format!("/out/{rel}/status.json"),
+            "result_url": format!("/out/{rel}/result.json"),
+            "request_url": format!("/out/{rel}/request.json"),
         }),
     )
 }

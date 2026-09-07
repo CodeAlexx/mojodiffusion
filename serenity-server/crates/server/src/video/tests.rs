@@ -241,6 +241,32 @@ fn ltx2_profile_runner_rejects_stale_build_inputs() {
 }
 
 #[test]
+fn minimax_h3_runner_uses_large_runtime_memory_contract() {
+    let runner = std::path::Path::new("/tmp/minimax_h3_test_runner");
+    let command = minimax_h3_capped_command(runner);
+
+    assert!(
+        command
+            .get_program()
+            .to_string_lossy()
+            .ends_with("scripts/mem_safe_runtime.sh")
+    );
+    assert_eq!(command.get_args().next(), Some(runner.as_os_str()));
+
+    let command_env = |key: &str| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    };
+    assert_eq!(command_env("MEM_MAX").as_deref(), Some("24G"));
+    assert_eq!(command_env("MEM_HIGH").as_deref(), Some("infinity"));
+    assert_eq!(command_env("SWAP_MAX").as_deref(), Some("2G"));
+    assert_eq!(command_env("DESKTOP_RESERVE").as_deref(), Some("16G"));
+}
+
+#[test]
 fn minimax_h3_request_is_runtime_adjustable_and_switchable() {
     let registry = minimax_h3_request_profile_registry();
     assert_eq!(registry.runner, MINIMAX_H3_REQUEST_RUNNER);
@@ -2161,5 +2187,65 @@ fn ltx2_context_cache_reuses_existing_prompt_entry() {
     assert_eq!(cache.key, key);
     assert_eq!(cache.path, expected);
     assert_eq!(cache.encoder_seconds, 0.0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn minimax_h3_controlnet_contract_preserves_order_and_fails_closed() {
+    let root = std::env::temp_dir().join(format!(
+        "serenity-h3-control-contract-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let motion = root.join("motion.mp4");
+    let depth = root.join("depth.mp4");
+    let source = root.join("source.mp4");
+    let mask = root.join("mask.png");
+    for path in [&motion, &depth, &source, &mask] {
+        std::fs::write(path, b"fixture").unwrap();
+    }
+    let request = json!({
+        "controls": [
+            {
+                "path": motion,
+                "preprocessor": "canny",
+                "resize_mode": "crop",
+                "canny_low": 90,
+                "canny_high": 180,
+                "strength": 1.1,
+                "start_percent": 0.0,
+                "end_percent": 0.8,
+                "source_path": source,
+                "mask_path": mask,
+                "invert_mask": true
+            },
+            {
+                "path": depth,
+                "preprocessor": "prepared",
+                "resize_mode": "pad",
+                "strength": 0.65,
+                "start_percent": 0.2,
+                "end_percent": 1.0
+            }
+        ]
+    });
+    let controls = minimax_h3_control_inputs(&request).unwrap();
+    assert_eq!(controls.len(), 2);
+    assert_eq!(controls[0].preprocessor, "canny");
+    assert_eq!(controls[1].resize_mode, "pad");
+    assert!(controls[0].source_path.is_some());
+    assert!(controls[0].mask_path.is_some());
+    assert!(controls[0].invert_mask);
+
+    let mut invalid = request.clone();
+    invalid["controls"][0]["canny_high"] = json!(90);
+    assert!(minimax_h3_control_inputs(&invalid)
+        .unwrap_err()
+        .contains("0 <= low < high <= 255"));
+    invalid = request.clone();
+    invalid["controls"][0]["mask_path"] = json!("");
+    assert!(minimax_h3_control_inputs(&invalid)
+        .unwrap_err()
+        .contains("source_path and mask_path together"));
     let _ = std::fs::remove_dir_all(root);
 }

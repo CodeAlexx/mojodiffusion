@@ -2568,6 +2568,41 @@ pub fn artifact_name_inventory() -> BTreeMap<String, Vec<String>> {
             .or_default()
             .push(artifact.name);
     }
+    // MiniMax-H3 keeps its text encoder and VAEs inside the checkpoint tree,
+    // not the registry's top-level clips/ and vaes/ folders. Publish those
+    // installed native artifacts to /object_info so the workflow UI resolves
+    // the exact files used by the Mojo runner instead of showing empty
+    // placeholder selectors.
+    let h3_root = model_root().join("checkpoints/MiniMax-H3/FL2VA");
+    let h3_artifacts = [
+        (
+            "clip",
+            "MiniMax-H3/FL2VA/text_encoder/serenity_int8_rowscale_v1",
+            h3_root.join("text_encoder/serenity_int8_rowscale_v1"),
+        ),
+        (
+            "vae",
+            "MiniMax-H3/FL2VA/video_vae/source/model.safetensors",
+            h3_root.join("video_vae/source/model.safetensors"),
+        ),
+        (
+            "vae",
+            "MiniMax-H3/FL2VA/audio_vae/model.safetensors",
+            h3_root.join("audio_vae/model.safetensors"),
+        ),
+    ];
+    for (artifact_type, name, path) in h3_artifacts {
+        if path.exists() {
+            inventory
+                .entry(artifact_type.to_string())
+                .or_default()
+                .push(name.to_string());
+        }
+    }
+    for names in inventory.values_mut() {
+        names.sort();
+        names.dedup();
+    }
     inventory
 }
 

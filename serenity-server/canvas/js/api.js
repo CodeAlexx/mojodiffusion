@@ -45,6 +45,95 @@ var SerenityAPI = (function () {
             var h3Sampler = nodes[keys[hs]];
             if (h3Sampler && h3Sampler.class_type === 'MiniMaxH3Sampler') {
                 var h3 = h3Sampler.inputs || {};
+                var controlApplyIds = keys.filter(function (nodeId) {
+                    return nodes[nodeId] &&
+                        nodes[nodeId].class_type === 'MiniMaxH3FunControlNetApplyMedia';
+                });
+                if (controlApplyIds.length) {
+                    var textNode = null;
+                    var latentNode = null;
+                    var controlLoader = null;
+                    keys.forEach(function (nodeId) {
+                        var node = nodes[nodeId] || {};
+                        if (node.class_type === 'MiniMaxH3TextEncode') textNode = node;
+                        if (node.class_type === 'MiniMaxH3EmptyLatent') latentNode = node;
+                        if (node.class_type === 'MiniMaxH3FunControlNetLoader') controlLoader = node;
+                    });
+                    if (!textNode || !latentNode || !controlLoader || !h3Loader)
+                        throw new Error('H3 ControlNet workflow is missing a native H3 node');
+                    var orderedReverse = [];
+                    var next = h3.conditioning;
+                    var seenControls = {};
+                    while (Array.isArray(next) && next.length === 2) {
+                        var nextId = String(next[0]);
+                        var nextNode = nodes[nextId];
+                        if (!nextNode || nextNode.class_type !==
+                            'MiniMaxH3FunControlNetApplyMedia') break;
+                        if (seenControls[nextId])
+                            throw new Error('H3 ControlNet conditioning chain is cyclic');
+                        seenControls[nextId] = true;
+                        orderedReverse.push(nextNode);
+                        next = (nextNode.inputs || {}).conditioning;
+                    }
+                    if (orderedReverse.length !== controlApplyIds.length)
+                        throw new Error('H3 ControlNet controls must form one conditioning chain');
+                    var ordered = orderedReverse.reverse();
+                    var controls = ordered.map(function (node, index) {
+                        var input = node.inputs || {};
+                        var result = {
+                            path: String(input.control_media || '').trim(),
+                            preprocessor: String(input.preprocessor || 'prepared'),
+                            resize_mode: String(input.resize_mode || 'crop'),
+                            canny_low: Number(input.canny_low == null ? 100 : input.canny_low),
+                            canny_high: Number(input.canny_high == null ? 200 : input.canny_high),
+                            strength: Number(input.strength == null ? 1 : input.strength),
+                            start_percent: Number(input.start_percent == null ? 0 : input.start_percent),
+                            end_percent: Number(input.end_percent == null ? 1 : input.end_percent)
+                        };
+                        if (!result.path)
+                            throw new Error('H3 ControlNet control ' + (index + 1) + ' has no media');
+                        if (index === 0) {
+                            result.source_path = String(input.source_media || '').trim();
+                            result.mask_path = String(input.mask_media || '').trim();
+                            result.invert_mask = input.invert_mask === true;
+                        }
+                        return result;
+                    });
+                    var latentInputs = latentNode.inputs || {};
+                    var textInputs = textNode.inputs || {};
+                    var controlLoaderInputs = controlLoader.inputs || {};
+                    var outputFrames = Number(latentInputs.output_frames) ||
+                        Number(latentInputs.length) || 120;
+                    var loras = Array.isArray(h3Loader.loras) ? h3Loader.loras.map(
+                        function (lora) {
+                            return {
+                                name: String(lora && lora.name || ''),
+                                strength: Number(lora && lora.strength)
+                            };
+                        }).filter(function (lora) { return lora.name; }) : [];
+                    return {
+                        schema: 'serenity.genparams.v1',
+                        model: 'minimax_h3',
+                        runner: 'minimax_h3_mojo_request',
+                        task: 'controlnet',
+                        prompt: String(textInputs.prompt || ''),
+                        controlnet: String(controlLoaderInputs.control_net_name || ''),
+                        controls: controls,
+                        loras: loras,
+                        width: Number(latentInputs.width) || 1344,
+                        height: Number(latentInputs.height) || 768,
+                        frames: outputFrames,
+                        fps: 24,
+                        duration_seconds: outputFrames / 24,
+                        // The visual graph stores N sigma points for N-1 calls.
+                        steps: Math.max(2, Number(h3.steps || 21) - 1),
+                        seed: Number(h3.seed) || 0,
+                        quant: 'int8',
+                        attention_backend: 'ck-int8',
+                        step_cache: 'exact',
+                        include_audio: true
+                    };
+                }
                 return {
                     schema: 'serenity.genparams.v1',
                     model: 'minimax_h3',

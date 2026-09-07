@@ -21,7 +21,7 @@
 
 .h3s-app {
     display: grid;
-    grid-template-rows: 58px minmax(0, 1fr) 158px 28px;
+    grid-template-rows: 58px minmax(0, 1fr) var(--h3-spine-h, 158px) 28px;
     height: 100%;
     min-height: 0;
     background:
@@ -313,3 +313,53 @@
 @media (prefers-reduced-motion: reduce) {
     #panel-h3-studio *, #panel-h3-studio *::before, #panel-h3-studio *::after { transition: none !important; animation: none !important; }
 }
+
+/* Contained movie library picker (header) */
+.h3s-project-open { display: flex; align-items: center; gap: 6px; margin-right: 4px; }
+.h3s-project-open > span { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .6; white-space: nowrap; }
+.h3s-project-open > select { min-width: 150px; max-width: 240px; padding: 5px 8px; font-size: 12px; border-radius: 6px; background: rgba(255,255,255,.04); color: inherit; border: 1px solid rgba(255,255,255,.12); }
+
+/* Continuity-spine thumbnails + per-card reorder/delete controls */
+.h3s-spine-shot { display: flex; flex-direction: column; gap: 6px; flex-basis: clamp(160px, 16vw, 220px); text-align: left; }
+.h3s-spine-thumb { width: 100%; aspect-ratio: 16 / 9; border-radius: 3px; object-fit: cover; background: #000; display: block; }
+.h3s-spine-thumb.is-empty { display: flex; align-items: center; justify-content: center; font: 700 20px/1 ui-monospace, monospace; color: var(--h3-dim); border: 1px dashed var(--h3-line); background: #101414; }
+.h3s-spine-body { min-width: 0; }
+.h3s-spine-controls { display: flex; gap: 5px; margin-top: 2px; }
+.h3s-spine-btn { flex: 1 1 auto; height: 24px; border-radius: 4px; border: 1px solid var(--h3-line); background: rgba(255,255,255,.05); color: var(--h3-muted); cursor: pointer; font-size: 12px; line-height: 1; padding: 0; }
+.h3s-spine-btn:hover { background: rgba(255,255,255,.12); }
+.h3s-spine-btn:disabled { opacity: .3; cursor: default; }
+.h3s-spine-btn.is-danger:hover { background: rgba(220,70,70,.35); border-color: rgba(220,70,70,.6); }
+
+/* Storyboard still as a temporary preview until a shot renders */
+.h3s-monitor-still { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+.h3s-monitor-storytag { position: absolute; left: 12px; bottom: 30px; z-index: 3; font: 700 10px/1 ui-monospace, monospace; letter-spacing: .08em; color: var(--h3-amber); background: rgba(0,0,0,.55); padding: 4px 8px; border-radius: 3px; }
+img.h3s-spine-thumb { object-fit: cover; }
+
+/* Monitor transport bar (play/pause/rewind/stop/play-cut + storyboard toggle) */
+.h3s-transport { display: flex; align-items: center; gap: 6px; padding: 8px 15px 2px; }
+.h3s-transport-spacer { flex: 1 1 auto; }
+.h3s-tbtn { min-width: 34px; height: 30px; padding: 0 8px; border-radius: 5px; border: 1px solid var(--h3-line); background: rgba(255,255,255,.05); color: var(--h3-ink); cursor: pointer; font-size: 14px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; }
+.h3s-tbtn:hover { background: rgba(255,255,255,.13); }
+.h3s-tbtn.is-wide { font-size: 11px; font-weight: 700; letter-spacing: .02em; padding: 0 11px; }
+.h3s-tbtn.is-on { border-color: var(--h3-amber); color: var(--h3-amber); background: var(--h3-amber-soft); }
+
+/* Resizable Continuity Spine */
+.h3s-timeline { position: relative; }
+.h3s-spine-resize { position: absolute; top: -3px; left: 0; right: 0; height: 8px; cursor: row-resize; z-index: 6; }
+.h3s-spine-resize::before { content: ""; position: absolute; left: 50%; top: 3px; transform: translateX(-50%); width: 46px; height: 3px; border-radius: 2px; background: #3a4142; }
+.h3s-spine-resize:hover::before { background: var(--h3-amber); }
+
+/* Keep the transport bar visibly below the monitor (was overlapping the stage) */
+.h3s-monitor-wrap { display: flex; flex-direction: column; flex-basis: min(50%, 440px); min-height: 268px; }
+.h3s-monitor-wrap > .h3s-monitor { flex: 1 1 auto; min-height: 0; }
+.h3s-transport { flex: 0 0 auto; }
+
+/* Cast editor (project-level recurring characters -> auto-inherited by every shot) */
+.h3s-cast { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.h3s-cast-empty { padding: 14px; border: 1px dashed rgba(255,255,255,.18); border-radius: 8px; color: rgba(255,255,255,.55); font-size: 12px; text-align: center; }
+.h3s-cast-card { display: flex; gap: 10px; padding: 10px; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; background: rgba(255,255,255,.03); }
+.h3s-cast-thumb { width: 72px; height: 72px; flex: 0 0 72px; border-radius: 8px; object-fit: cover; background: rgba(0,0,0,.35); border: 1px solid rgba(255,255,255,.12); }
+.h3s-cast-thumb.is-empty { display: flex; align-items: center; justify-content: center; font-size: 10px; color: rgba(255,255,255,.4); text-align: center; }
+.h3s-cast-body { flex: 1 1 auto; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.h3s-textarea.is-cast { min-height: 54px; resize: vertical; }
+.h3s-cast-actions { display: flex; gap: 6px; }

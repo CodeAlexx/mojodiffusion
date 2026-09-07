@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/home/alex/mojodiffusion/.codex/hooks/verify_gate.sh'"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -134,7 +134,8 @@ var GenerateTab = (function () {
         scail2Mode: 'animation',
         additionalReferenceImagePaths: [],
         additionalReferenceMaskPaths: [],
-        mediaUploadsInFlight: 0
+        mediaUploadsInFlight: 0,
+        h3References: []
     };
     var initialized = false;
     var errorTimer = null;
@@ -787,13 +788,23 @@ var GenerateTab = (function () {
             '<input type="number" id="gen-custom-height" class="gen-number-input" value="1024" disabled></div>' +
             '<div id="gen-aspect-preview" class="gen-aspect-preview"><span>1024×1024</span></div></div>';
         var sourceBody =
+            '<div id="gen-single-source">' +
             '<div id="gen-init-drop" class="gen-init-drop">' +
             '<input id="gen-init-image-input" type="file" accept="image/*" aria-label="Choose source image">' +
             '<div id="gen-init-empty"><i data-lucide="image-plus"></i><span>Choose or drop a source image</span></div>' +
             '<img id="gen-init-preview" style="display:none" alt="Selected source image"></div>' +
             '<div id="gen-init-name" class="gen-init-name">No source image</div>' +
             '<button id="gen-init-clear" type="button" class="gen-small-btn destructive" disabled>Clear source</button>' +
-            '<div class="gen-capability-note">The selected source is used for admitted img2img and I2V routes. Source Assets can select the same field without uploading again.</div>';
+            '<div class="gen-capability-note">The selected image is used by admitted image-to-image and image-to-video routes.</div></div>' +
+            '<div id="gen-h3-reference-source" style="display:none">' +
+            '<input id="gen-h3-reference-input" type="file" accept="image/*,video/*,audio/*" multiple hidden>' +
+            '<div id="gen-h3-reference-drop" class="gen-h3-reference-drop" role="button" tabindex="0" aria-label="Drop image, video, or audio references, or click to choose files">' +
+            '<strong>Drop images, videos, or audio here</strong><span>or click to choose files</span></div>' +
+            '<div class="gen-h3-reference-actions"><button id="gen-h3-reference-add" type="button" class="gen-small-btn">Choose files</button>' +
+            '<button id="gen-h3-reference-clear" type="button" class="gen-small-btn destructive" disabled>Clear</button></div>' +
+            '<div id="gen-h3-reference-note" class="gen-capability-note">No references · plain text-to-video</div>' +
+            '<div id="gen-h3-reference-list" class="gen-lora-list"></div>' +
+            '<div class="gen-capability-note">Ref2VA · selection order is reference order · video/audio must be 2–15 seconds.</div></div>';
         var samplingBody =
             '<div class="gen-param-row" data-param-search="sampler algorithm"><label class="gen-label" for="gen-sampler">Sampler</label><select id="gen-sampler" class="gen-select"></select></div>' +
             '<div class="gen-param-row" data-param-search="scheduler noise schedule"><label class="gen-label" for="gen-scheduler">Scheduler</label><select id="gen-scheduler" class="gen-select"></select></div>' +
@@ -994,7 +1005,7 @@ var GenerateTab = (function () {
             generateGroup('gen-core-header', 'Core Parameters', coreBody, true, 'The controls used by every admitted generation backend.') +
             '<section id="gen-variation-section">' + generateGroup('gen-variation-header', 'Variation Seed', variationBody, false, 'Blend deterministic secondary noise into supported model families.') + '</section>' +
             generateGroup('gen-image-header', 'Resolution', resolutionBody, false, 'Only compiled, production-admitted shapes are listed.') +
-            generateGroup('gen-source-header', 'Source Image', sourceBody, false, 'Upload once or reuse an Asset for admitted img2img and I2V generation.') +
+            generateGroup('gen-source-header', 'Source / References', sourceBody, false, 'Add source images or ordered H3 image, video, and audio references.') +
             generateGroup('gen-sampling-header', 'Sampling', samplingBody, false, 'Sampler and scheduler values come from the selected backend capability report.') +
             '<section id="gen-video-section">' + generateGroup('gen-video-header', 'Video', videoBody, false, 'Video duration, frame rate, guidance, quantization, and audio parameters.') + '</section>' +
             '<section id="gen-video-conditioning-section">' + generateGroup('gen-video-conditioning-header', 'Video Conditioning', videoConditioningBody, false, 'Prompt-matched LTX2 conditioning and optional deterministic noise artifacts.') + '</section>' +
@@ -1011,7 +1022,7 @@ var GenerateTab = (function () {
             '</div>' +
             generateGroup('gen-output-header', 'Output', outputBody, false, 'Output container is selected by the admitted image or video route.') +
             '</div>' +
-            '<label class="gen-workspace-advanced-toggle"><input id="gen-show-advanced" type="checkbox" checked> Display Advanced Options <span id="gen-advanced-count"></span></label>' +
+            '<div class="gen-workspace-advanced-toggle is-locked">Advanced Options · Always Visible <span id="gen-advanced-count"></span></div>' +
             '<div id="gen-left-progress" class="gen-progress gen-left-progress"><div id="gen-left-progress-bar" class="gen-progress-bar"></div></div>' +
             '<div id="gen-left-progress-label" class="gen-left-progress-label"></div>';
     }
@@ -1065,8 +1076,8 @@ var GenerateTab = (function () {
             '<button class="gen-library-tab" data-library="models">Models</button>' +
             '<button class="gen-library-tab" data-library="loras">LoRAs</button>' +
             '<div class="gen-library-spacer"></div>' +
-            '<button id="gen-gallery-upload-btn" class="gen-gallery-subtab-btn" title="Upload source image"><i data-lucide="upload"></i></button>' +
-            '<input type="file" id="gen-gallery-upload-input" accept="image/*" multiple style="display:none">' +
+            '<button id="gen-gallery-upload-btn" class="gen-gallery-subtab-btn" title="Upload source media"><i data-lucide="upload"></i></button>' +
+            '<input type="file" id="gen-gallery-upload-input" accept="image/*,video/*,audio/*" multiple style="display:none">' +
             '<button id="gen-gallery-search-btn" class="gen-gallery-subtab-btn" title="Search current library"><i data-lucide="search"></i></button>' +
             '<input id="gen-gallery-search-input" class="gen-gallery-search" type="text" placeholder="Search current library...">' +
             '<button id="gen-gallery-settings-btn" class="gen-gallery-subtab-btn" title="History display settings"><i data-lucide="settings"></i></button>' +
@@ -1255,6 +1266,9 @@ var GenerateTab = (function () {
         els.assetsContent = document.getElementById('gen-assets-content');
         els.assetsGrid = document.getElementById('gen-assets-grid');
         els.assetsPlaceholder = document.getElementById('gen-assets-placeholder');
+        els.h3ReferencesList = document.getElementById('gen-h3-reference-list');
+        els.h3ReferencesNote = document.getElementById('gen-h3-reference-note');
+        els.h3ReferencesClear = document.getElementById('gen-h3-reference-clear');
         // New elements
         els.leftPanel = document.getElementById('gen-left-panel');
         els.rightPanel = document.getElementById('gen-right-panel');
@@ -1707,6 +1721,7 @@ var GenerateTab = (function () {
             state.creativity = Math.max(0, Math.min(1, parseFloat(v) || 0));
         });
         bindInitImage();
+        bindH3References();
         // Model searchable picker
         bindModelPicker();
         // Model refresh button
@@ -2615,6 +2630,310 @@ var GenerateTab = (function () {
         if (clear)
             clear.disabled = true;
     }
+
+    function h3ReferenceKind(file) {
+        var type = String(file && file.type || '').toLowerCase();
+        var name = String(file && file.name || '').toLowerCase();
+        if (type.indexOf('image/') === 0 || /\.(png|jpe?g|webp|bmp|gif)$/.test(name))
+            return 'image';
+        if (type.indexOf('video/') === 0 || /\.(mp4|mov|mkv|webm|avi|m4v)$/.test(name))
+            return 'video';
+        if (type.indexOf('audio/') === 0 || /\.(wav|mp3|m4a|aac|flac|ogg|opus)$/.test(name))
+            return 'audio';
+        return '';
+    }
+
+    function h3ReferenceCounts(rows) {
+        var counts = { image: 0, video: 0, audio: 0 };
+        (rows || []).forEach(function (row) {
+            if (Object.prototype.hasOwnProperty.call(counts, row.kind))
+                counts[row.kind] += 1;
+        });
+        return counts;
+    }
+
+    function h3ReferenceLimitError(rows) {
+        var limits = minimaxH3ReferenceLimits();
+        var counts = h3ReferenceCounts(rows);
+        if (rows.length > limits.combined || counts.image > limits.image ||
+            counts.video > limits.video || counts.audio > limits.audio) {
+            return 'H3 Ref2VA limit: ' + limits.combined + ' combined, ' +
+                limits.image + ' images, ' + limits.video + ' videos, ' +
+                limits.audio + ' audio';
+        }
+        if (counts.audio && !counts.image && !counts.video)
+            return 'H3 audio references require an image or video reference';
+        return '';
+    }
+
+    function renderH3References() {
+        if (!els.h3ReferencesList)
+            return;
+        els.h3ReferencesList.innerHTML = '';
+        state.h3References.forEach(function (reference, index) {
+            var row = document.createElement('div');
+            row.className = 'gen-lora-row gen-h3-reference-row';
+            var label = document.createElement('span');
+            label.className = 'gen-lora-name';
+            label.textContent = (index + 1) + '. ' +
+                String(reference.kind || '').toUpperCase() + ' · ' +
+                String(reference.name || reference.path || 'reference') +
+                (reference.error ? ' · upload failed' :
+                    (reference.path ? ' · ready' : ' · uploading'));
+            label.title = String(reference.path || reference.error || '');
+            row.appendChild(label);
+            if (reference.kind === 'audio' || reference.kind === 'video') {
+                var audioUse = document.createElement('select');
+                audioUse.className = 'gen-select gen-h3-audio-use';
+                [
+                    ['reference', 'Audio reference'],
+                    ['reuse', 'Reuse soundtrack'],
+                    ['voice_timbre', 'Voice timbre']
+                ].forEach(function (definition) {
+                    var option = document.createElement('option');
+                    option.value = definition[0];
+                    option.textContent = definition[1];
+                    audioUse.appendChild(option);
+                });
+                audioUse.value = reference.audioUse || reference.audio_use || 'reference';
+                audioUse.addEventListener('change', function () {
+                    reference.audioUse = this.value;
+                });
+                row.appendChild(audioUse);
+            }
+            [-1, 1].forEach(function (delta) {
+                var move = document.createElement('button');
+                move.type = 'button';
+                move.className = 'gen-small-btn gen-h3-reference-move';
+                move.textContent = delta < 0 ? '↑' : '↓';
+                move.title = delta < 0 ? 'Move reference earlier' : 'Move reference later';
+                move.disabled = index + delta < 0 || index + delta >= state.h3References.length;
+                move.addEventListener('click', function () {
+                    var target = index + delta;
+                    var item = state.h3References.splice(index, 1)[0];
+                    state.h3References.splice(target, 0, item);
+                    renderH3References();
+                });
+                row.appendChild(move);
+            });
+            var remove = document.createElement('button');
+            remove.type = 'button';
+            remove.className = 'gen-small-btn destructive';
+            remove.textContent = 'Remove';
+            remove.addEventListener('click', function () {
+                state.h3References.splice(index, 1);
+                renderH3References();
+                refreshMinimaxH3DurationLimit();
+                if (state.assetsLoaded)
+                    renderAssets();
+            });
+            row.appendChild(remove);
+            els.h3ReferencesList.appendChild(row);
+        });
+        var limits = minimaxH3ReferenceLimits();
+        var counts = h3ReferenceCounts(state.h3References);
+        if (els.h3ReferencesNote) {
+            els.h3ReferencesNote.textContent = state.h3References.length === 0
+                ? 'No references · plain text-to-video'
+                : state.h3References.length + '/' + limits.combined + ' · ' +
+                    counts.image + '/' + limits.image + ' images · ' +
+                    counts.video + '/' + limits.video + ' videos · ' +
+                    counts.audio + '/' + limits.audio + ' audio';
+        }
+        if (els.h3ReferencesClear)
+            els.h3ReferencesClear.disabled = state.h3References.length === 0;
+    }
+
+    function addH3ReferenceAsset(asset) {
+        if (!asset || ['image', 'video', 'audio'].indexOf(asset.media_type) < 0) {
+            showError('Choose an image, video, or audio asset');
+            return;
+        }
+        if (!asset.path) {
+            showError('This asset has no worker-readable path');
+            return;
+        }
+        if (state.h3References.some(function (reference) {
+            return reference.path === asset.path;
+        })) {
+            showError('That reference is already added');
+            return;
+        }
+        var reference = {
+            kind: asset.media_type,
+            name: asset.name || asset.path,
+            path: asset.path,
+            url: asset.url || '',
+            audioUse: 'reference',
+            error: ''
+        };
+        var candidate = state.h3References.concat([reference]);
+        var limitError = h3ReferenceLimitError(candidate);
+        if (limitError && limitError.indexOf('audio references require') < 0) {
+            showError(limitError);
+            return;
+        }
+        state.h3References.push(reference);
+        renderH3References();
+        refreshMinimaxH3DurationLimit();
+        renderAssets();
+    }
+
+    function addH3ReferenceFiles(files) {
+        Array.prototype.forEach.call(files || [], function (file) {
+            var kind = h3ReferenceKind(file);
+            if (!kind) {
+                showError('Unsupported H3 reference file: ' + file.name);
+                return;
+            }
+            var reference = {
+                kind: kind,
+                name: file.name || (kind + '-reference'),
+                path: '',
+                url: '',
+                audioUse: 'reference',
+                uploadPromise: null,
+                error: ''
+            };
+            var candidate = state.h3References.concat([reference]);
+            var limitError = h3ReferenceLimitError(candidate);
+            if (limitError && limitError.indexOf('audio references require') < 0) {
+                showError(limitError);
+                return;
+            }
+            state.h3References.push(reference);
+            state.mediaUploadsInFlight += 1;
+            reference.uploadPromise = SerenityAPI.uploadMediaDetails(file)
+                .then(function (data) {
+                reference.path = String(data.path || data.name || '');
+                reference.url = String(data.url || '');
+                if (!reference.path)
+                    throw new Error('Media upload returned no worker-readable path');
+                reference.error = '';
+                state.assetsLoaded = false;
+                renderH3References();
+                return reference.path;
+            })
+                .catch(function (error) {
+                reference.error = error.message || String(error);
+                renderH3References();
+                throw error;
+            })
+                .finally(function () {
+                state.mediaUploadsInFlight = Math.max(0, state.mediaUploadsInFlight - 1);
+            });
+            reference.uploadPromise.catch(function () {
+                /* Error is shown in the reference row and at Generate time. */
+            });
+        });
+        renderH3References();
+        refreshMinimaxH3DurationLimit();
+    }
+
+    function resolvedH3References() {
+        var limitError = h3ReferenceLimitError(state.h3References);
+        if (limitError)
+            return Promise.reject(new Error(limitError));
+        return Promise.all(state.h3References.map(function (reference) {
+            var ready = reference.path
+                ? Promise.resolve(reference.path)
+                : reference.uploadPromise;
+            if (!ready) {
+                return Promise.reject(new Error(
+                    'Reference "' + reference.name + '" must be selected again'));
+            }
+            return ready.then(function (path) {
+                return {
+                    kind: reference.kind,
+                    path: path,
+                    audio_use: reference.audioUse || reference.audio_use || 'reference'
+                };
+            });
+        }));
+    }
+
+    function setH3ReferenceMode(enabled) {
+        var single = document.getElementById('gen-single-source');
+        var h3 = document.getElementById('gen-h3-reference-source');
+        var sourceHeader = document.getElementById('gen-source-header');
+        var sourceBody = document.getElementById('gen-source-body');
+        if (enabled && state.initImagePath && !state.h3References.some(function (reference) {
+            return reference.path === state.initImagePath;
+        })) {
+            var migratedImage = {
+                kind: 'image',
+                name: state.initImageName || state.initImagePath,
+                path: state.initImagePath,
+                url: '',
+                audioUse: 'reference',
+                error: ''
+            };
+            if (!h3ReferenceLimitError([migratedImage].concat(state.h3References)))
+                state.h3References.unshift(migratedImage);
+        }
+        if (single)
+            single.style.display = enabled ? 'none' : '';
+        if (h3)
+            h3.style.display = enabled ? '' : 'none';
+        if (enabled) {
+            if (sourceHeader)
+                sourceHeader.classList.remove('closed');
+            if (sourceBody)
+                sourceBody.classList.remove('closed');
+            renderH3References();
+        }
+        if (state.assetsLoaded)
+            renderAssets();
+    }
+
+    function bindH3References() {
+        var source = document.getElementById('gen-h3-reference-source');
+        var drop = document.getElementById('gen-h3-reference-drop');
+        var input = document.getElementById('gen-h3-reference-input');
+        var add = document.getElementById('gen-h3-reference-add');
+        var clear = document.getElementById('gen-h3-reference-clear');
+        if (!source || !drop || !input || !add || !clear)
+            return;
+        add.addEventListener('click', function () { input.click(); });
+        drop.addEventListener('click', function () { input.click(); });
+        drop.addEventListener('keydown', function (event) {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                input.click();
+            }
+        });
+        input.addEventListener('change', function () {
+            addH3ReferenceFiles(this.files);
+            this.value = '';
+        });
+        clear.addEventListener('click', function () {
+            state.h3References = [];
+            input.value = '';
+            renderH3References();
+            refreshMinimaxH3DurationLimit();
+            if (state.assetsLoaded)
+                renderAssets();
+        });
+        ['dragenter', 'dragover'].forEach(function (eventName) {
+            drop.addEventListener(eventName, function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                if (event.dataTransfer)
+                    event.dataTransfer.dropEffect = 'copy';
+                drop.classList.add('dragover');
+            });
+        });
+        ['dragleave', 'drop'].forEach(function (eventName) {
+            drop.addEventListener(eventName, function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                drop.classList.remove('dragover');
+            });
+        });
+        drop.addEventListener('drop', function (event) {
+            addH3ReferenceFiles(event.dataTransfer && event.dataTransfer.files);
+        });
+    }
     function bindGenerateControls() {
         ['gen-core', 'gen-variation', 'gen-sampling', 'gen-video',
             'gen-source', 'gen-video-conditioning', 'gen-lora', 'gen-advanced-runtime',
@@ -3457,6 +3776,26 @@ var GenerateTab = (function () {
         }) || null;
     }
 
+    function activeMinimaxH3Ref2vaMode() {
+        var runner = activeMinimaxH3Runner();
+        var modes = runner && Array.isArray(runner.conditioned_modes)
+            ? runner.conditioned_modes : [];
+        return modes.find(function (mode) {
+            return mode && mode.id === 'ref2va';
+        }) || null;
+    }
+
+    function minimaxH3ReferenceLimits() {
+        var mode = activeMinimaxH3Ref2vaMode();
+        var inputs = mode && mode.reference_inputs || {};
+        return {
+            combined: Number(inputs.max_combined) || 12,
+            image: Number(inputs.image_max) || 9,
+            video: Number(inputs.video_max) || 3,
+            audio: Number(inputs.audio_max) || 3
+        };
+    }
+
     function normalizeMinimaxH3AttentionBackend(quant, backend) {
         var runner = activeMinimaxH3Runner();
         return H3AttentionContracts.resolveBackend(
@@ -3514,6 +3853,13 @@ var GenerateTab = (function () {
         var runner = activeMinimaxH3Runner();
         var constraints = runner && runner.geometry_constraints || {};
         var trainedMax = Number(constraints.trained_seconds_max) || 15;
+        if (state.h3References && state.h3References.length) {
+            var ref2vaMode = activeMinimaxH3Ref2vaMode();
+            var ref2vaMax = Number(ref2vaMode && ref2vaMode.geometry &&
+                ref2vaMode.geometry.seconds_max);
+            return Number.isFinite(ref2vaMax) && ref2vaMax > 0
+                ? ref2vaMax : trainedMax;
+        }
         var absoluteMax = Number(constraints.seconds_max) || trainedMax;
         var tokenMax = Number(constraints.long_context_max_sequence_tokens) || 0;
         if (absoluteMax <= trainedMax || tokenMax <= 0)
@@ -3999,6 +4345,8 @@ var GenerateTab = (function () {
     }
     function updateGenerateUIForArch(arch) {
         var previousArch = state.arch;
+        state.arch = arch;
+        setH3ReferenceMode(arch === 'minimax_h3');
         if (arch === 'ltxv') {
             updateVideoUIForArch(arch);
             return;
@@ -4337,6 +4685,15 @@ var GenerateTab = (function () {
         }
         // Filter disabled LoRAs
         var enabledLoras = state.loras.filter(function (l) { return l.enabled !== false; });
+        var readyH3References = state.h3References.filter(function (reference) {
+            return !!reference.path;
+        }).map(function (reference) {
+            return {
+                kind: reference.kind,
+                path: reference.path,
+                audio_use: reference.audioUse || reference.audio_use || 'reference'
+            };
+        });
         return WorkflowBuilder.build({
             model: state.model || '',
             prompt: finalPrompt,
@@ -4360,6 +4717,8 @@ var GenerateTab = (function () {
             additionalReferenceImagePaths: state.additionalReferenceImagePaths.slice(),
             additionalReferenceMaskPaths: state.additionalReferenceMaskPaths.slice(),
             initImageName: state.initImagePath || state.initImageName || '',
+            h3Task: readyH3References.length ? 'ref2va' : 't2va',
+            h3References: readyH3References,
             ltx2Mode: state.videoGuidanceMode,
             quantization: state.videoQuant,
             h3AttentionBackend: state.h3AttentionBackend,
@@ -4433,7 +4792,7 @@ var GenerateTab = (function () {
         }
         return request;
     }
-    function buildVideoRequest(seed) {
+    function buildVideoRequest(seed, resolvedReferences) {
         var finalPrompt = state.prompt.trim();
         if (state.stylePreset && state.stylePreset !== 'none') {
             for (var i = 0; i < stylePresets.length; i++) {
@@ -4458,15 +4817,13 @@ var GenerateTab = (function () {
                 frames: state.frames,
                 fps: state.fps,
                 duration_seconds: Math.max(1, Math.min(
-                    minimaxH3MaxDurationForSize(state.width, state.height),
+                    h3DurationMax,
                     Number(state.seconds) || state.frames / Math.max(1, state.fps))),
                 steps: Number(state.steps) || 20,
                 seed: seed,
-                quant: state.videoQuant === 'bf16'
-                    ? 'bf16'
-                    : (state.videoQuant === 'int8' ? 'int8' : 'int8-fast'),
+                quant: h3Quant,
                 attention_backend: normalizeMinimaxH3AttentionBackend(
-                    state.videoQuant, state.h3AttentionBackend),
+                    h3Quant, state.h3AttentionBackend),
                 step_cache: state.h3StepCache === 'high' ? 'high' : 'exact',
                 include_audio: true
             };
@@ -4663,51 +5020,71 @@ var GenerateTab = (function () {
             ? Math.floor(Math.random() * 4294967296)
             : state.seed;
         state.lastSeed = seed;
-        beginCurrentBatch();
-        state.pendingBatch = 1;
-        var request = buildVideoRequest(seed);
-        var reusable = getParams();
-        reusable.seed = seed;
-        reusable.arch = ModelUtils.archForModel(reusable.model);
-        reusable.width = request.width;
-        reusable.height = request.height;
-        reusable.steps = request.steps;
-        reusable.sampler = request.sampler;
-        reusable.scheduler = request.scheduler;
-        reusable.frames = request.frames;
-        reusable.fps = request.fps;
-        if (Number.isFinite(Number(request.guidance))) {
-            reusable.cfg = Number(request.guidance);
-            reusable.guidance = Number(request.guidance);
-        }
         setGenerating(true);
-        updateGenerationActivity('Preparing GPU · unloading image model if resident', 0, 0);
-        SerenityAPI.postVideo(request)
-            .then(function (job) {
-            if (job && job.accepted_video_artifact === true && job.mp4_url) {
-                var videoId = String(job.video_id || '');
-                var metadata = Object.assign({}, reusable, {
-                    params: reusable,
-                    frame_count: request.frames,
-                    fps: request.fps,
-                    mode: job.mode ||
-                        (request.image_path ? 'i2v_first_frame' : 't2v')
-                });
-                displayVideo(String(job.mp4_url), metadata);
-                addToGallery(String(job.mp4_url), true, metadata);
-                if (videoId)
-                    state.completedVideoJobs[videoId] = true;
-                state.pendingBatch = 0;
+        var h3 = ModelUtils.archForModel(state.model) === 'minimax_h3';
+        updateGenerationActivity(h3 && state.mediaUploadsInFlight > 0
+            ? 'Uploading H3 reference media'
+            : 'Preparing GPU · unloading image model if resident', 0, 0);
+        var referencesReady = h3
+            ? resolvedH3References() : Promise.resolve([]);
+        referencesReady.then(function (references) {
+            var request;
+            try {
+                request = buildVideoRequest(seed, references);
+            }
+            catch (error) {
+                showError(error && error.message ? error.message : String(error));
                 setGenerating(false);
                 return;
             }
-            if (!job || !(job.video_id || job.prompt_id))
-                throw new Error('server did not return a video job id');
-            pollVideoGeneration(job, request, reusable);
-        })
-            .catch(function (error) {
+            beginCurrentBatch();
+            state.pendingBatch = 1;
+            var reusable = getParams();
+            reusable.seed = seed;
+            reusable.arch = ModelUtils.archForModel(reusable.model);
+            reusable.width = request.width;
+            reusable.height = request.height;
+            reusable.steps = request.steps;
+            reusable.sampler = request.sampler;
+            reusable.scheduler = request.scheduler;
+            reusable.frames = request.frames;
+            reusable.fps = request.fps;
+            if (Number.isFinite(Number(request.guidance))) {
+                reusable.cfg = Number(request.guidance);
+                reusable.guidance = Number(request.guidance);
+            }
+            updateGenerationActivity('Preparing GPU · unloading image model if resident', 0, 0);
+            SerenityAPI.postVideo(request)
+                .then(function (job) {
+                if (job && job.accepted_video_artifact === true && job.mp4_url) {
+                    var videoId = String(job.video_id || '');
+                    var metadata = Object.assign({}, reusable, {
+                        params: reusable,
+                        frame_count: request.frames,
+                        fps: request.fps,
+                        mode: job.mode || request.task ||
+                            (request.image_path ? 'i2v_first_frame' : 't2v')
+                    });
+                    displayVideo(String(job.mp4_url), metadata);
+                    addToGallery(String(job.mp4_url), true, metadata);
+                    if (videoId)
+                        state.completedVideoJobs[videoId] = true;
+                    state.pendingBatch = 0;
+                    setGenerating(false);
+                    return;
+                }
+                if (!job || !(job.video_id || job.prompt_id))
+                    throw new Error('server did not return a video job id');
+                pollVideoGeneration(job, request, reusable);
+            })
+                .catch(function (error) {
+                state.pendingBatch = 0;
+                showError('Failed to queue video: ' + error.message);
+                setGenerating(false);
+            });
+        }).catch(function (error) {
             state.pendingBatch = 0;
-            showError('Failed to queue video: ' + error.message);
+            showError('H3 reference upload failed: ' + error.message);
             setGenerating(false);
         });
     }
@@ -6405,6 +6782,10 @@ var GenerateTab = (function () {
         return size + ' B';
     }
     function useAssetAsSource(asset) {
+        if (state.arch === 'minimax_h3') {
+            addH3ReferenceAsset(asset);
+            return;
+        }
         if (!asset || asset.media_type !== 'image') {
             showError('Only image assets can be used as an I2V/img2img source here');
             return;
@@ -6468,6 +6849,10 @@ var GenerateTab = (function () {
             .then(function () {
             if (state.initImagePath === asset.path)
                 clearInitImage();
+            state.h3References = state.h3References.filter(function (reference) {
+                return reference.path !== asset.path;
+            });
+            renderH3References();
             return loadAssets(true);
         })
             .catch(function (error) {
@@ -6491,21 +6876,37 @@ var GenerateTab = (function () {
                 : 'Assets are unavailable';
         }
         assets.forEach(function (asset) {
+            var h3Selected = state.h3References.some(function (reference) {
+                return reference.path === asset.path;
+            });
+            var selected = state.arch === 'minimax_h3'
+                ? h3Selected : state.initImagePath === asset.path;
             var card = document.createElement('div');
             card.className = 'gen-asset-card' +
-                (state.initImagePath === asset.path ? ' selected' : '');
-            var media = asset.media_type === 'video'
-                ? document.createElement('video')
-                : document.createElement('img');
+                (selected ? ' selected' : '');
+            var media;
+            if (asset.media_type === 'video')
+                media = document.createElement('video');
+            else if (asset.media_type === 'audio') {
+                media = document.createElement('div');
+                media.textContent = 'AUDIO';
+            }
+            else
+                media = document.createElement('img');
             media.className = 'gen-asset-preview';
-            media.src = String(asset.url || '');
+            if (asset.media_type === 'audio')
+                media.classList.add('gen-asset-audio');
             if (asset.media_type === 'video') {
+                media.src = String(asset.url || '');
                 media.muted = true;
                 media.preload = 'metadata';
             }
-            else {
+            else if (asset.media_type === 'image') {
+                media.src = String(asset.url || '');
                 media.loading = 'lazy';
                 media.alt = String(asset.name || 'source asset');
+            }
+            if (state.arch === 'minimax_h3' || asset.media_type === 'image') {
                 card.addEventListener('dblclick', function () {
                     useAssetAsSource(asset);
                 });
@@ -6525,13 +6926,14 @@ var GenerateTab = (function () {
             card.appendChild(meta);
             var actions = document.createElement('div');
             actions.className = 'gen-asset-actions';
-            if (asset.media_type === 'image') {
+            if (state.arch === 'minimax_h3' || asset.media_type === 'image') {
                 var use = document.createElement('button');
                 use.type = 'button';
                 use.className = 'gen-asset-use';
-                use.textContent = state.initImagePath === asset.path
-                    ? 'Source selected'
-                    : 'Use as source';
+                use.textContent = state.arch === 'minimax_h3'
+                    ? (h3Selected ? 'Reference added' : 'Add reference')
+                    : (selected ? 'Source selected' : 'Use as source');
+                use.disabled = selected;
                 use.addEventListener('click', function () {
                     useAssetAsSource(asset);
                 });
@@ -6585,28 +6987,11 @@ var GenerateTab = (function () {
     }
     function handleUploadFiles(files) {
         Array.prototype.forEach.call(files, function (file) {
-            if (!file.type.startsWith('image/')) {
-                showError('Assets currently accept source images');
+            if (!h3ReferenceKind(file)) {
+                showError('Assets accept image, video, or audio files');
                 return;
             }
-            // Upload to server
-            var formData = new FormData();
-            formData.append('image', file);
-            fetch('/upload/image', { method: 'POST', body: formData })
-                .then(function (response) {
-                return response.text().then(function (body) {
-                    var data = {};
-                    try {
-                        data = JSON.parse(body);
-                    }
-                    catch (error) {
-                        data = { detail: body };
-                    }
-                    if (!response.ok)
-                        throw new Error(data.detail || ('HTTP ' + response.status));
-                    return data;
-                });
-            })
+            SerenityAPI.uploadMediaDetails(file)
                 .then(function (data) {
                 if (!data || !data.path || !data.url)
                     throw new Error('upload returned no persistent asset path');
@@ -6744,6 +7129,17 @@ var GenerateTab = (function () {
             ltx2CameraMotion: state.cameraMotion,
             initImagePath: state.initImagePath,
             initImageName: state.initImageName,
+            h3References: state.h3References.filter(function (reference) {
+                return !!reference.path;
+            }).map(function (reference) {
+                return {
+                    kind: reference.kind,
+                    name: reference.name || reference.path,
+                    path: reference.path,
+                    url: reference.url || '',
+                    audio_use: reference.audioUse || reference.audio_use || 'reference'
+                };
+            }),
             noSeedIncrement: state.noSeedIncrement,
             continueAfterErrors: state.continueAfterErrors,
             personalNote: state.personalNote,
@@ -6779,6 +7175,23 @@ var GenerateTab = (function () {
             });
         }
         params = normalized;
+        var savedH3References = Array.isArray(params.h3References)
+            ? params.h3References
+            : (Array.isArray(params.references) ? params.references : []);
+        state.h3References = savedH3References.map(function (reference) {
+            var path = String(reference && reference.path || '');
+            var kind = String(reference && reference.kind || '');
+            return {
+                kind: kind,
+                name: String(reference && reference.name || path.split(/[\\/]/).pop() || path),
+                path: path,
+                url: String(reference && reference.url || ''),
+                audioUse: String(reference && (reference.audio_use || reference.audioUse) || 'reference'),
+                error: ''
+            };
+        }).filter(function (reference) {
+            return ['image', 'video', 'audio'].indexOf(reference.kind) >= 0 && !!reference.path;
+        });
         if (typeof params.model === 'string' && params.model) {
             var requestedModel = params.model === 'ltx2'
                 ? String(params.videoCheckpoint || params.checkpoint ||
@@ -7011,6 +7424,10 @@ var GenerateTab = (function () {
         updateAspectPreview();
         updateTokenCount();
         updateStylePreview();
+        renderH3References();
+        refreshMinimaxH3DurationLimit();
+        if (state.assetsLoaded)
+            renderAssets();
         closeModelDropdown();
     }
 

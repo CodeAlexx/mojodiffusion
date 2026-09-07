@@ -144,7 +144,7 @@ must(studio.includes('opening Studio never starts GPU work'), 'no-auto-generatio
 must(studio.includes('Start endless story') && studio.includes('Stop after current'), 'Endless explicit controls missing');
 must(studio.includes('C.videoJobUrls') && studio.includes('C.endlessSnapshotsEqual'), 'Endless safe resume/URL reconstruction missing');
 must(studio.includes('browser never rebuilds model state or starts training'), 'Endless inference-only contract missing');
-must(studio.includes('Continuity spine') && studio.includes('Prepare Qwen Director pass'), 'filmmaker workspace surfaces missing');
+must(studio.includes('Continuity spine') && studio.includes('Run Qwen Director pass') && studio.includes('Prepare Qwen Director pass'), 'filmmaker workspace surfaces missing');
 must(css.includes('.h3s-workspace') && css.includes('.h3s-spine-shot') && css.includes('@media (prefers-reduced-motion: reduce)'), 'film layout/accessibility CSS missing');
 const shell = fs.readFileSync(path.join(root, 'serenity-server/canvas/js/shell.js'), 'utf8');
 must(shell.includes("new URLSearchParams(window.location.search).get('tab')"), 'direct H3 Studio deep link missing');

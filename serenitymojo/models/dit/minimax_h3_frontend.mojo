@@ -721,7 +721,7 @@ struct MiniMaxH3FrontendEmbed(Movable):
 def minimax_h3_frontend_embed[TR_S: Int, TR_H: Int, TR_DH: Int](
     video_rows: Tensor,  # [Nv, 96] F32, already-patchified
     audio_rows: Tensor,  # [Na, 32] F32, already-packed
-    text_rows: Tensor,  # [Nt=TR_S, 5120] bf16
+    text_rows: Tensor,  # [Nt=TR_S, 5120 raw or 5376 already-refined] bf16
     timesteps: Tensor,  # [num_timesteps] F32
     video_indices: List[Int],
     audio_indices: List[Int],
@@ -747,22 +747,28 @@ def minimax_h3_frontend_embed[TR_S: Int, TR_H: Int, TR_DH: Int](
     var audio_embeds_f32 = minimax_h3_audio_patch_embed(audio_rows, w, ctx)
     var audio_embeds = torch_f32_to_bf16_rne(audio_embeds_f32, ctx)
 
-    var text_embeds0 = minimax_h3_condition_embed(text_rows, w, ctx)
-    var text_embeds = minimax_h3_token_refiner[TR_S, TR_H, TR_DH](
-        text_embeds0, w, config, ctx, lora_overlay
-    )
-
-    var hidden = minimax_h3_scatter_streams(
-        video_embeds,
-        audio_embeds,
-        text_embeds,
-        video_indices,
-        audio_indices,
-        text_indices,
-        sequence_length,
-        config.hidden_size,
-        ctx,
-    )
+    var hidden: Tensor
+    if text_rows.shape()[1] == config.hidden_size:
+        # Accept the immutable request-scoped result directly so the denoise
+        # loop does not repeat two invariant refiner blocks per evaluation.
+        hidden = minimax_h3_scatter_streams(
+            video_embeds, audio_embeds, text_rows, video_indices,
+            audio_indices, text_indices, sequence_length, config.hidden_size,
+            ctx,
+        )
+    elif text_rows.shape()[1] == config.text_dim:
+        # Retain the original raw-text entry contract for parity/unit callers.
+        var text_embeds0 = minimax_h3_condition_embed(text_rows, w, ctx)
+        var text_embeds = minimax_h3_token_refiner[TR_S, TR_H, TR_DH](
+            text_embeds0, w, config, ctx, lora_overlay
+        )
+        hidden = minimax_h3_scatter_streams(
+            video_embeds, audio_embeds, text_embeds, video_indices,
+            audio_indices, text_indices, sequence_length, config.hidden_size,
+            ctx,
+        )
+    else:
+        raise Error("MiniMax-H3 frontend text width is neither raw nor refined")
     var temb = minimax_h3_timestep_embedding(timesteps, w, config, ctx)
     return MiniMaxH3FrontendEmbed(hidden^, temb^)
 
@@ -787,21 +793,35 @@ def minimax_h3_frontend_embed_dynamic[
     """Runtime text/packed sequence frontend for request-driven H3 modes."""
     var video_embeds = _minimax_h3_video_patch_embed_bf16(video_rows, w, ctx)
     var audio_embeds = _minimax_h3_audio_patch_embed_bf16(audio_rows, w, ctx)
-    var text_embeds0 = minimax_h3_condition_embed(text_rows, w, ctx)
-    var text_embeds = minimax_h3_token_refiner_dynamic[TR_H, TR_DH](
-        text_embeds0, w, config, ctx, lora_overlay
-    )
     var hidden: Tensor
-    if t2va_contiguous:
-        hidden = minimax_h3_concat_t2va_streams(
-            video_embeds, audio_embeds, text_embeds, sequence_length, ctx,
+    if text_rows.shape()[1] == config.hidden_size:
+        if t2va_contiguous:
+            hidden = minimax_h3_concat_t2va_streams(
+                video_embeds, audio_embeds, text_rows, sequence_length, ctx,
+            )
+        else:
+            hidden = minimax_h3_scatter_streams(
+                video_embeds, audio_embeds, text_rows, video_indices,
+                audio_indices, text_indices, sequence_length,
+                config.hidden_size, ctx,
+            )
+    elif text_rows.shape()[1] == config.text_dim:
+        var text_embeds0 = minimax_h3_condition_embed(text_rows, w, ctx)
+        var text_embeds = minimax_h3_token_refiner_dynamic[TR_H, TR_DH](
+            text_embeds0, w, config, ctx, lora_overlay
         )
+        if t2va_contiguous:
+            hidden = minimax_h3_concat_t2va_streams(
+                video_embeds, audio_embeds, text_embeds, sequence_length, ctx,
+            )
+        else:
+            hidden = minimax_h3_scatter_streams(
+                video_embeds, audio_embeds, text_embeds, video_indices,
+                audio_indices, text_indices, sequence_length,
+                config.hidden_size, ctx,
+            )
     else:
-        hidden = minimax_h3_scatter_streams(
-            video_embeds, audio_embeds, text_embeds, video_indices,
-            audio_indices, text_indices, sequence_length, config.hidden_size,
-            ctx,
-        )
+        raise Error("MiniMax-H3 frontend text width is neither raw nor refined")
     var temb = minimax_h3_timestep_embedding(timesteps, w, config, ctx)
     return MiniMaxH3FrontendEmbed(hidden^, temb^)
 

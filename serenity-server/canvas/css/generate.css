@@ -1474,6 +1474,63 @@
     gap: 6px;
     margin-bottom: 8px;
 }
+.gen-h3-reference-actions {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 7px;
+}
+.gen-h3-reference-drop {
+    display: flex;
+    min-height: 84px;
+    margin-bottom: 7px;
+    padding: 12px;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    border: 1px dashed var(--shell-border);
+    border-radius: 8px;
+    background: var(--shell-bg-panel);
+    color: var(--shell-text);
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease;
+}
+.gen-h3-reference-drop:hover,
+.gen-h3-reference-drop:focus,
+.gen-h3-reference-drop.dragover {
+    border: 1px dashed var(--shell-accent);
+    background: var(--shell-bg-hover);
+    outline: none;
+}
+.gen-h3-reference-drop strong {
+    font-size: 12px;
+}
+.gen-h3-reference-drop span {
+    color: var(--shell-text-muted);
+    font-size: 11px;
+}
+.gen-h3-reference-row {
+    flex-wrap: wrap;
+}
+.gen-h3-reference-row .gen-lora-name {
+    flex-basis: 100%;
+}
+.gen-h3-audio-use {
+    flex: 1;
+    min-width: 120px;
+}
+.gen-h3-reference-move {
+    padding-inline: 7px;
+}
+.gen-asset-audio {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--shell-text-muted);
+    font: 600 11px var(--shell-font);
+    letter-spacing: 0.12em;
+}
 .gen-lora-row {
     display: flex;
     align-items: center;
@@ -3165,4 +3222,10 @@ body.gen-resizing-y * {
     .gen-workspace-negative {
         display: none;
     }
+}
+
+/* SerenityFlow is Advanced-only: the complete parameter surface is permanent. */
+.gen-workspace-advanced-toggle.is-locked {
+    cursor: default;
+    user-select: none;
 }

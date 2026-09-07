@@ -60,9 +60,15 @@
 # Mojo 1.0.0b1, NVIDIA GPU.
 
 from std.collections import Dict, List, Optional
+from std.gpu import global_idx
+from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from std.memory import ArcPointer
 from std.sys.defines import get_defined_int
+from std.utils.index import IndexList
+
+from layout import Layout, LayoutTensor
+from layout.runtime_layout import RuntimeLayout
 
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.tensor import Tensor
@@ -145,6 +151,182 @@ comptime MINIMAX_H3_SAGE_PV8_MIN_S = 13312
 comptime MINIMAX_H3_ATTN_SAGE_EXACT_PREFIX_BASE = 100000
 comptime MINIMAX_H3_ATTN_SAGE_FAST_EXACT_PREFIX_BASE = 200000
 comptime MINIMAX_H3_ATTN_COMFY_KITCHEN_EXACT_PREFIX_BASE = 300000
+comptime _H3_PREFIX_DYN1 = Layout.row_major(-1)
+comptime _H3_PREFIX_COPY_BLOCK = 256
+
+
+def _minimax_h3_gather_mod_chunk_bf16(
+    mod: LayoutTensor[DType.bfloat16, _H3_PREFIX_DYN1, MutAnyOrigin],
+    row_ids: LayoutTensor[DType.int32, _H3_PREFIX_DYN1, MutAnyOrigin],
+    output: LayoutTensor[DType.bfloat16, _H3_PREFIX_DYN1, MutAnyOrigin],
+    rows_w: Int32,
+    hidden_w: Int32,
+    mod_width_w: Int32,
+    chunk_w: Int32,
+):
+    var rows = Int(rows_w)
+    var hidden = Int(hidden_w)
+    var mod_width = Int(mod_width_w)
+    var chunk = Int(chunk_w)
+    var index = Int(global_idx.x)
+    if index < rows * hidden:
+        var output_row = index // hidden
+        var column = index % hidden
+        var mod_row = Int(rebind[Scalar[DType.int32]](row_ids[output_row]))
+        output[index] = mod[mod_row * mod_width + chunk * hidden + column]
+
+
+def _minimax_h3_upload_adaln_rows(
+    adaln_indices: List[Int], mod_rows: Int, ctx: DeviceContext
+) raises -> Tensor:
+    """Upload one prevalidated row map for all six direct AdaLN gathers."""
+    var rows = len(adaln_indices)
+    if rows == 0:
+        raise Error("MiniMax-H3 AdaLN row map is empty")
+    var row_host = ctx.enqueue_create_host_buffer[DType.uint8](rows * 4)
+    var row_host_ptr = row_host.unsafe_ptr().bitcast[Int32]()
+    for row in range(rows):
+        var index = adaln_indices[row]
+        if index < 0 or index >= mod_rows:
+            raise Error("MiniMax-H3 AdaLN row map index is out of range")
+        row_host_ptr[row] = Int32(index)
+    var row_device = ctx.enqueue_create_buffer[DType.uint8](rows * 4)
+    ctx.enqueue_copy(dst_buf=row_device, src_buf=row_host)
+    var shape: List[Int] = [rows]
+    return Tensor(row_device^, shape^, STDtype.I32)
+
+
+def _minimax_h3_gather_mod_chunk_device(
+    mod: Tensor,
+    adaln_rows: Tensor,
+    chunk: Int,
+    hidden: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Gather one AdaLN chunk from the compact table using a shared device map."""
+    var mod_shape = mod.shape()
+    var row_shape = adaln_rows.shape()
+    if mod.dtype() != STDtype.BF16 or adaln_rows.dtype() != STDtype.I32:
+        raise Error("MiniMax-H3 direct AdaLN gather requires BF16 mod and I32 rows")
+    if len(mod_shape) != 2 or mod_shape[1] != 6 * hidden:
+        raise Error("MiniMax-H3 direct AdaLN gather modulation shape mismatch")
+    if len(row_shape) != 1 or row_shape[0] <= 0:
+        raise Error("MiniMax-H3 direct AdaLN gather row-map shape mismatch")
+    if chunk < 0 or chunk >= 6:
+        raise Error("MiniMax-H3 direct AdaLN gather chunk is outside [0,6)")
+
+    var rows = row_shape[0]
+    var total = rows * hidden
+    var mod_layout = RuntimeLayout[_H3_PREFIX_DYN1].row_major(
+        IndexList[1](mod.numel())
+    )
+    var row_layout = RuntimeLayout[_H3_PREFIX_DYN1].row_major(
+        IndexList[1](rows)
+    )
+    var output_layout = RuntimeLayout[_H3_PREFIX_DYN1].row_major(
+        IndexList[1](total)
+    )
+    var output_buffer = ctx.enqueue_create_buffer[DType.uint8](total * 2)
+    var MOD = LayoutTensor[
+        DType.bfloat16, _H3_PREFIX_DYN1, MutAnyOrigin
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(mod.buf.unsafe_ptr().bitcast[BFloat16]())
+        ),
+        runtime_layout=mod_layout,
+    )
+    var ROW_IDS = LayoutTensor[
+        DType.int32, _H3_PREFIX_DYN1, MutAnyOrigin
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=Int(
+                adaln_rows.buf.unsafe_ptr().bitcast[Int32]()
+            )
+        ),
+        runtime_layout=row_layout,
+    )
+    var OUTPUT = LayoutTensor[
+        DType.bfloat16, _H3_PREFIX_DYN1, MutAnyOrigin
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(
+                output_buffer.unsafe_ptr().bitcast[BFloat16]()
+            )
+        ),
+        runtime_layout=output_layout,
+    )
+    ctx.enqueue_function[_minimax_h3_gather_mod_chunk_bf16](
+        MOD,
+        ROW_IDS,
+        OUTPUT,
+        Int32(rows),
+        Int32(hidden),
+        Int32(mod_shape[1]),
+        Int32(chunk),
+        grid_dim=ceildiv(total, _H3_PREFIX_COPY_BLOCK),
+        block_dim=_H3_PREFIX_COPY_BLOCK,
+    )
+    var output_shape: List[Int] = [rows, hidden]
+    return Tensor(output_buffer^, output_shape^, STDtype.BF16)
+
+
+def _minimax_h3_copy_prefix_inplace(
+    source: LayoutTensor[DType.bfloat16, _H3_PREFIX_DYN1, MutAnyOrigin],
+    destination: LayoutTensor[DType.bfloat16, _H3_PREFIX_DYN1, MutAnyOrigin],
+    elements_w: Int64,
+):
+    var index = Int(global_idx.x)
+    var elements = Int(elements_w)
+    if index < elements:
+        destination[index] = source[index]
+
+
+def _minimax_h3_overwrite_exact_prefix(
+    var approximate: Tensor,
+    exact_prefix: Tensor,
+    prefix_rows: Int,
+    heads: Int,
+    head_dim: Int,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    """Replace the approximate prefix without copying its full video tail."""
+    var prefix_elements = prefix_rows * heads * head_dim
+    if exact_prefix.dtype() != STDtype.BF16 \
+            or exact_prefix.numel() != prefix_elements \
+            or approximate.dtype() != STDtype.BF16 \
+            or approximate.numel() < prefix_elements:
+        raise Error("MiniMax-H3 exact-prefix overwrite shape mismatch")
+    var prefix_layout = RuntimeLayout[_H3_PREFIX_DYN1].row_major(
+        IndexList[1](prefix_elements)
+    )
+    var SOURCE = LayoutTensor[
+        DType.bfloat16, _H3_PREFIX_DYN1, MutAnyOrigin
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(
+                exact_prefix.buf.unsafe_ptr().bitcast[BFloat16]()
+            )
+        ),
+        runtime_layout=prefix_layout,
+    )
+    var DESTINATION = LayoutTensor[
+        DType.bfloat16, _H3_PREFIX_DYN1, MutAnyOrigin
+    ](
+        unsafe_ptr=Pointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=Int(
+                approximate.buf.unsafe_ptr().bitcast[BFloat16]()
+            )
+        ),
+        runtime_layout=prefix_layout,
+    )
+    ctx.enqueue_function[_minimax_h3_copy_prefix_inplace](
+        SOURCE,
+        DESTINATION,
+        Int64(prefix_elements),
+        grid_dim=ceildiv(prefix_elements, _H3_PREFIX_COPY_BLOCK),
+        block_dim=_H3_PREFIX_COPY_BLOCK,
+    )
+    return approximate^
 comptime MINIMAX_H3_EVG_BUILD_ENABLED = get_defined_int["H3_EVG", 0]() != 0
 comptime MINIMAX_H3_ADAPTIVE_SM120_BUILD_ENABLED = (
     get_defined_int["H3_ADAPTIVE_SM120", 0]() != 0
@@ -426,10 +608,14 @@ def _minimax_h3_attention_dispatch(
         var exact_prefix = sdpa_flash_infer_fwd_cross_dynamic(
             q_prefix, k, v, scale, ctx
         )
-        var video_tail = slice(
-            approximate, 1, prefix_rows, sequence_length - prefix_rows, ctx
+        return _minimax_h3_overwrite_exact_prefix(
+            approximate^,
+            exact_prefix,
+            prefix_rows,
+            shape[2],
+            shape[3],
+            ctx,
         )
-        return concat(1, ctx, exact_prefix, video_tail)
     raise Error(
         String("minimax_h3_block_forward: unknown attention backend ")
         + String(attention_backend)
@@ -1473,33 +1659,33 @@ def _minimax_h3_block_forward_impl[
             evg_layout, evg_step, comfy_kitchen_scratch,
             adaptive_sm120_scratch, adaptive_sink_tokens,
         )
-    var shift_msa: Tensor
-    var scale_msa: Tensor
-    var gate_msa: Tensor
-    var shift_mlp = Optional[Tensor](None)
-    var scale_mlp = Optional[Tensor](None)
-    var gate_mlp = Optional[Tensor](None)
-    if low_headroom:
-        shift_msa = _minimax_h3_gather_mod_chunk(
-            mod, adaln_indices, 0, hidden, ctx
-        )
-        scale_msa = _minimax_h3_gather_mod_chunk(
-            mod, adaln_indices, 1, hidden, ctx
-        )
-        gate_msa = _minimax_h3_gather_mod_chunk(
-            mod, adaln_indices, 2, hidden, ctx
-        )
-    else:
-        var gathered = gather_rows(mod, adaln_indices, ctx)
-        shift_msa = slice(gathered, 1, 0 * hidden, hidden, ctx)
-        scale_msa = slice(gathered, 1, 1 * hidden, hidden, ctx)
-        gate_msa = slice(gathered, 1, 2 * hidden, hidden, ctx)
-        var shift_mlp_t = slice(gathered, 1, 3 * hidden, hidden, ctx)
-        var scale_mlp_t = slice(gathered, 1, 4 * hidden, hidden, ctx)
-        var gate_mlp_t = slice(gathered, 1, 5 * hidden, hidden, ctx)
-        shift_mlp = Optional[Tensor](shift_mlp_t^)
-        scale_mlp = Optional[Tensor](scale_mlp_t^)
-        gate_mlp = Optional[Tensor](gate_mlp_t^)
+    # Upload the row map once, then gather each compact chunk directly. The old
+    # path first expanded `[S, 6*hidden]` and copied six slices back out, moving
+    # the whole modulation payload twice per block.
+    var adaln_rows_device = _minimax_h3_upload_adaln_rows(
+        adaln_indices, mod.shape()[0], ctx
+    )
+    var shift_msa = _minimax_h3_gather_mod_chunk_device(
+        mod, adaln_rows_device, 0, hidden, ctx
+    )
+    var scale_msa = _minimax_h3_gather_mod_chunk_device(
+        mod, adaln_rows_device, 1, hidden, ctx
+    )
+    var gate_msa = _minimax_h3_gather_mod_chunk_device(
+        mod, adaln_rows_device, 2, hidden, ctx
+    )
+    var shift_mlp_t = _minimax_h3_gather_mod_chunk_device(
+        mod, adaln_rows_device, 3, hidden, ctx
+    )
+    var scale_mlp_t = _minimax_h3_gather_mod_chunk_device(
+        mod, adaln_rows_device, 4, hidden, ctx
+    )
+    var gate_mlp_t = _minimax_h3_gather_mod_chunk_device(
+        mod, adaln_rows_device, 5, hidden, ctx
+    )
+    var shift_mlp = Optional[Tensor](shift_mlp_t^)
+    var scale_mlp = Optional[Tensor](scale_mlp_t^)
+    var gate_mlp = Optional[Tensor](gate_mlp_t^)
 
     # ── Self-attention branch ──
     var attn_in = _minimax_h3_rms_norm_modulate(
@@ -1536,6 +1722,7 @@ def _minimax_h3_block_forward_impl[
         and weights[qkv_scale_name][].dtype() == STDtype.F32
         and not qkv_lora
     )
+    var direct_qkv_keepalive = Optional[MiniMaxH3Int8QKV](None)
     if direct_w8a8_qkv:
         # Write Q/K/V directly from the single packed W8A8 accumulator. The
         # old ordinary path materialized `[S,3*inner]` and then launched three
@@ -1564,9 +1751,7 @@ def _minimax_h3_block_forward_impl[
             evg_layout, evg_step, layer, comfy_kitchen_scratch,
             adaptive_sm120_scratch, adaptive_sink_tokens,
         )
-        # The split owner is branch-local.  Finish its final consumer before
-        # its three buffers are returned to the stream-ordered allocator.
-        ctx.synchronize()
+        direct_qkv_keepalive = Optional[MiniMaxH3Int8QKV](split_qkv^)
     else:
         # Compatibility fallback for non-production test weights.
         var qkv_out = _minimax_h3_block_linear_lora(
@@ -1599,6 +1784,11 @@ def _minimax_h3_block_forward_impl[
         merged, x, gate_msa, weights, prefix + "attn.out_proj.weight",
         layer, 1, lora_overlay, ctx,
     )
+    if direct_qkv_keepalive:
+        # Output projection is ordered after attention on the same stream.
+        # Drain both together, then release Q/K/V before the MLP allocations.
+        ctx.synchronize()
+        direct_qkv_keepalive = Optional[MiniMaxH3Int8QKV](None)
 
     # ── MLP branch ──
     var x2: Tensor

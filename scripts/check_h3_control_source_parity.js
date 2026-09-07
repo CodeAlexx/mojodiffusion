@@ -19,11 +19,40 @@ function load(paths, extras) {
 }
 
 // The visible graph and CSS remain source-faithful to SerenityFlow. Only the
-// browser/server execution boundary is Mojo-specific.
+// browser/server execution boundary is Mojo-specific, plus the two deliberate
+// run-card changes below. Keep this list explicit so any OTHER drift still
+// fails: the point of the gate is that the screen does not quietly diverge.
+//
+//  - the per-item readiness checklist is not rendered (its checks still gate
+//    the Generate button and the live dot), so its rules are dead here;
+//  - .h3ct-run-card is sticky at the bottom of .h3ct-stage, so an unbounded
+//    media pane pushed the transport/scrubber underneath it and the recent
+//    grid lost its last row. Both need explicit clearance.
+const CSS_LOCAL_CHANGES = [
+  [/\.h3ct-readiness \{[^}]*\}\n/, ""],
+  [/\.h3ct-readiness span[^\n]*\n/g, ""],
+  ["    .h3ct-workflow-actions,\n    .h3ct-readiness,\n    .h3ct-recent-list { grid-template-columns: 1fr; }",
+   "    .h3ct-workflow-actions,\n    .h3ct-recent-list { grid-template-columns: 1fr; }"],
+  // anchored on .h3ct-media-pane: `min-height: 360px` also appears in an
+  // earlier rule, so an unanchored replace silently retargets it.
+  ["    min-width: 0;\n    min-height: 360px;\n    display: flex;",
+   "    min-width: 0;\n"
+   + "    /* .h3ct-run-card is sticky at the bottom of the stage, so an unbounded\n"
+   + "       pane pushed the transport bar underneath it and the scrubber was not\n"
+   + "       visible until you scrolled. Leave room for the stage header, the\n"
+   + "       transport and the sticky card. */\n"
+   + "    min-height: 280px;\n    max-height: calc(100vh - 478px);\n    display: flex;"],
+  [".h3ct-recent { margin: 0 0 14px; }",
+   "/* .h3ct-run-card is sticky at the bottom of .h3ct-stage, so the recent grid\n"
+   + "   that follows it in the scroll flow slid underneath and its last row was\n"
+   + "   unreachable. Reserve the card's height. */\n"
+   + ".h3ct-recent { margin: 0 0 14px; padding-bottom: 240px; }"],
+];let expectedCss = read(path.join(sourceCanvas, "css", "h3-control.css"));
+for (const [from, to] of CSS_LOCAL_CHANGES) expectedCss = expectedCss.replace(from, to);
 assert.strictEqual(
   read(path.join(targetCanvas, "css", "h3-control.css")).trimEnd(),
-  read(path.join(sourceCanvas, "css", "h3-control.css")).trimEnd(),
-  "H3 ControlNet CSS drifted from the SerenityFlow product reference",
+  expectedCss.trimEnd(),
+  "H3 ControlNet CSS drifted from the SerenityFlow product reference beyond the run-card changes",
 );
 
 const source = load([

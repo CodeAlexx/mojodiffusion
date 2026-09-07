@@ -5853,6 +5853,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/h3/projects/:id",
             put(h3_projects::put_project).delete(h3_projects::delete_project),
         )
+        .route(
+            "/v1/h3/projects/:id/movie",
+            post(h3_projects::post_assemble_movie),
+        )
         .route("/v1/jobs", get(jobs::get_jobs))
         .route(
             "/v1/history/artifacts",

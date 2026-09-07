@@ -29,6 +29,7 @@ var H3StudioTab = (function () {
         modal: '',
         library: null,
         currentProjectId: '',
+        assembledMovie: null,
         storyboardView: false
     };
 
@@ -232,6 +233,7 @@ var H3StudioTab = (function () {
             '<button class="h3s-btn is-quiet" data-h3-action="delete-project">Delete movie</button>' +
             '<button class="h3s-btn" data-h3-action="export-project">Export project</button>' +
             '<button class="h3s-btn" data-h3-action="export-edit">Export edit</button>' +
+            '<button class="h3s-btn is-primary" data-h3-action="assemble-movie">Assemble movie</button>' +
             '</div></header>';
     }
 
@@ -320,6 +322,23 @@ var H3StudioTab = (function () {
     function monitorHtml() {
         var shot = selectedShot();
         var mode = C.detectMode(shot);
+        // A just-assembled movie owns the monitor until the user picks a shot
+        // again -- otherwise the film is only ever a line of status text and
+        // there is no way to watch it without leaving the tab.
+        if (state.assembledMovie && state.assembledMovie.url) {
+            var film = state.assembledMovie;
+            return '<div class="h3s-monitor-wrap"><div class="h3s-monitor">' +
+                '<video controls autoplay preload="metadata" src="' + attr(film.url) + '"></video>' +
+                '<div class="h3s-monitor-bars"></div>' +
+                '<span class="h3s-safe-corner tl"></span><span class="h3s-safe-corner tr"></span>' +
+                '<span class="h3s-safe-corner bl"></span><span class="h3s-safe-corner br"></span>' +
+                '<div class="h3s-monitor-hud"><span>' + escapeHtml(film.title || 'Movie') + ' \u00b7 ' +
+                    (film.shots_used || []).length + ' shots</span>' +
+                '<span>ASSEMBLED DELIVERY \u00b7 <a href="' + attr(film.url) + '" target="_blank" rel="noopener">open</a></span></div>' +
+                '</div><div class="h3s-button-row" style="margin-top:9px">' +
+                '<button class="h3s-btn" data-h3-action="close-movie">Back to shots</button>' +
+                '<button class="h3s-btn" data-h3-action="assemble-movie">Re-assemble</button></div></div>';
+        }
         var take = shot.selected_take >= 0 ? shot.take_output_paths[shot.selected_take] : '';
         var src = state.storyboardView ? '' : (take || shot.output_path || '');
         var content = src
@@ -493,12 +512,30 @@ var H3StudioTab = (function () {
                     escapeHtml(backend.label || backend.id) +
                     (available ? '' : ' · unavailable') + '</option>';
             }).join('');
+        // The server already declares these presets as
+        // "tested_presets_not_an_exhaustive_allowlist" and publishes the real
+        // native range, but the inspector only ever offered the preset list, so
+        // no other resolution was reachable from the UI at all. Width and height
+        // are typed against the advertised range; the presets just fill them.
+        var runtimeGeometry = ((h3Runner() || {}).geometry) || {};
+        var resolutionPresets = Array.isArray(runtimeGeometry.resolutions) && runtimeGeometry.resolutions.length
+            ? runtimeGeometry.resolutions : C.RESOLUTIONS;
+        var dimStep = Number(runtimeGeometry.dimension_step) || 32;
+        var wMin = Number(runtimeGeometry.width_min) || 512, wMax = Number(runtimeGeometry.width_max) || 1536;
+        var hMin = Number(runtimeGeometry.height_min) || 512, hMax = Number(runtimeGeometry.height_max) || 1536;
+        var presetMatch = resolutionPresets.some(function (row) {
+            return Number(row.width) === Number(shot.width) && Number(row.height) === Number(shot.height);
+        });
         return '<label class="h3s-check"><input type="checkbox" data-shot-field="locked"' + checked(lock) + '><span>Lock approved shot. Protect prompt, references, sound, order and takes.</span></label>' +
             '<label class="h3s-field" style="margin-top:10px"><span>Shot name</span><input class="h3s-input" data-shot-field="title" value="' + attr(shot.title) + '"' + disabled(lock) + '></label>' +
             '<div class="h3s-grid-2"><label class="h3s-field"><span>Duration · 5–15s</span><input class="h3s-input" type="number" min="5" max="15" step="0.25" data-shot-field="duration_seconds" value="' + attr(shot.duration_seconds) + '"' + disabled(lock) + '></label>' +
-            '<label class="h3s-field"><span>Resolution</span><select id="h3s-resolution" class="h3s-select"' + disabled(lock) + '>' + C.RESOLUTIONS.map(function (row) {
-                return '<option value="' + row.width + 'x' + row.height + '"' + selected(shot.width + 'x' + shot.height, row.width + 'x' + row.height) + '>' + row.label + '</option>';
-            }).join('') + '</select></label></div>' +
+            '<label class="h3s-field"><span>Preset</span><select id="h3s-resolution" class="h3s-select"' + disabled(lock) + '>' +
+                (presetMatch ? '' : '<option value="" selected>Custom \u00b7 ' + shot.width + '\u00d7' + shot.height + '</option>') +
+                resolutionPresets.map(function (row) {
+                    return '<option value="' + row.width + 'x' + row.height + '"' + selected(shot.width + 'x' + shot.height, row.width + 'x' + row.height) + '>' + row.label + '</option>';
+                }).join('') + '</select></label></div>' +
+            '<div class="h3s-grid-2"><label class="h3s-field"><span>Width \u00b7 ' + wMin + '\u2013' + wMax + '</span><input class="h3s-input" type="number" min="' + wMin + '" max="' + wMax + '" step="' + dimStep + '" data-shot-field="width" value="' + shot.width + '"' + disabled(lock) + '></label>' +
+            '<label class="h3s-field"><span>Height \u00b7 ' + hMin + '\u2013' + hMax + '</span><input class="h3s-input" type="number" min="' + hMin + '" max="' + hMax + '" step="' + dimStep + '" data-shot-field="height" value="' + shot.height + '"' + disabled(lock) + '></label></div>' +
             '<div class="h3s-grid-2"><label class="h3s-field"><span>Steps</span><input class="h3s-input" type="number" min="2" max="50" data-shot-field="steps" value="' + shot.steps + '"' + disabled(lock) + '></label><label class="h3s-field"><span>Seed</span><input class="h3s-input" type="number" min="0" max="4294967295" data-shot-field="seed" value="' + shot.seed + '"' + disabled(lock) + '></label></div>' +
             '<label class="h3s-field"><span>Opening frame</span><div class="h3s-button-row"><input class="h3s-input" data-shot-field="first_frame" value="' + attr(shot.first_frame) + '" placeholder="Server-uploaded path"' + disabled(lock) + '><button class="h3s-btn" data-h3-action="upload-first"' + disabled(lock) + '>Choose</button></div></label>' +
             '<label class="h3s-field"><span>Ending frame</span><div class="h3s-button-row"><input class="h3s-input" data-shot-field="last_frame" value="' + attr(shot.last_frame) + '" placeholder="Server-uploaded path"' + disabled(lock) + '><button class="h3s-btn" data-h3-action="upload-last"' + disabled(lock) + '>Choose</button></div></label>' +
@@ -622,9 +659,11 @@ var H3StudioTab = (function () {
             showToast('The endless base shot is immutable until this run stops or completes.', 'error'); render(); return;
         }
         var value = target.type === 'checkbox' ? target.checked : target.value;
-        if (['duration_seconds', 'steps', 'seed', 'motion_context_frames'].indexOf(field) >= 0) value = Number(value);
+        if (['duration_seconds', 'steps', 'seed', 'motion_context_frames', 'width', 'height'].indexOf(field) >= 0) value = Number(value);
         shot[field] = value;
-        if (field !== 'prompt_override' && field !== 'locked' && ['title', 'seed', 'steps', 'quant', 'attention_backend', 'step_cache', 'motion_context_frames'].indexOf(field) < 0) shot.prompt_override = '';
+        // Geometry, like seed and steps, is a render setting rather than prompt
+        // content: changing it must not discard an authored prompt override.
+        if (field !== 'prompt_override' && field !== 'locked' && ['title', 'seed', 'steps', 'quant', 'attention_backend', 'step_cache', 'motion_context_frames', 'width', 'height'].indexOf(field) < 0) shot.prompt_override = '';
         if (field === 'quant' || field === 'attention_backend')
             shot.attention_backend = resolvedH3Attention(shot);
         saveProject();
@@ -708,7 +747,7 @@ var H3StudioTab = (function () {
         var projectTitle = document.getElementById('h3s-project-title');
         if (projectTitle) projectTitle.addEventListener('input', function () { state.project.title = projectTitle.value; saveProject(); });
         var resolution = document.getElementById('h3s-resolution');
-        if (resolution) resolution.addEventListener('change', function () { if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base dimensions are immutable during the active run.', 'error'); render(); return; } var parts = resolution.value.split('x'); selectedShot().width = Number(parts[0]); selectedShot().height = Number(parts[1]); saveProject(); render(); });
+        if (resolution) resolution.addEventListener('change', function () { if (baseShotMutationBlocked(selectedShot())) { showToast('The endless base dimensions are immutable during the active run.', 'error'); render(); return; } if (!resolution.value) return; var parts = resolution.value.split('x'); selectedShot().width = Number(parts[0]); selectedShot().height = Number(parts[1]); saveProject(); render(); });
         var action = document.getElementById('h3s-director-action');
         if (action) action.addEventListener('change', function () { state.directorAction = action.value; state.requestJson = ''; render(); });
         var panels = document.getElementById('h3s-character-panels');
@@ -800,6 +839,8 @@ var H3StudioTab = (function () {
         else if (action === 'import-project') document.getElementById('h3s-project-import').click();
         else if (action === 'export-project') downloadJson(safeName(state.project.title) + '.serenitymovie.json', state.project);
         else if (action === 'export-edit') downloadJson(safeName(state.project.title) + '.serenityedit.json', C.deliveryManifest(state.project));
+        else if (action === 'assemble-movie') assembleMovie();
+        else if (action === 'close-movie') { state.assembledMovie = null; render(); }
         else if (action === 'add-shot') addShot();
         else if (action === 'duplicate-shot') duplicateShot();
         else if (action === 'delete-shot') deleteShot();
@@ -875,6 +916,39 @@ var H3StudioTab = (function () {
         if (!window.confirm('Delete selected shot from this project?')) return;
         var index = selectedShotIndex(); state.project.shots.splice(index, 1); state.selectedShotId = state.project.shots[Math.min(index, state.project.shots.length - 1)].id; saveProject('Shot deleted'); render();
     }
+    // Assemble the ordered selected takes into one delivery file. The server
+    // normalises each segment to a single container spec before concatenating;
+    // a raw concat of individually-encoded takes desynchronises the audio.
+    // Saves the project first so the server assembles what is on screen.
+    function assembleMovie() {
+        var id = state.currentProjectId;
+        if (!id) { setStatus('Save the movie before assembling.', 'error'); return; }
+        setStatus('Assembling movie\u2026', 'live');
+        showToast('Assembling movie\u2026', 'live');
+        fetch('/v1/h3/projects/' + encodeURIComponent(id), {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(state.project)
+        }).then(function () {
+            return fetch('/v1/h3/projects/' + encodeURIComponent(id) + '/movie', { method: 'POST' });
+        }).then(function (response) {
+            return response.text().then(function (text) {
+                if (!response.ok) throw new Error(text || ('HTTP ' + response.status));
+                return JSON.parse(text);
+            });
+        }).then(function (data) {
+            state.assembledMovie = data;
+            var skipped = (data.shots_skipped || []).length;
+            var message = (data.shots_used || []).length + ' shot(s) assembled into ' +
+                (data.title || 'the movie') +
+                (skipped ? ' \u2014 ' + skipped + ' skipped with no rendered take' : '') + '.';
+            setStatus(message, 'live'); showToast(message, 'live');
+            render();
+        }).catch(function (error) {
+            setStatus('Assemble failed: ' + error.message, 'error');
+            showToast('Assemble failed: ' + error.message, 'error');
+        });
+    }
+
     function moveShot(delta) {
         if (endlessChainShotLocked(selectedShot())) { showToast('An active endless chain shot cannot be reordered.', 'error'); return; }
         var index = selectedShotIndex(), target = index + delta; if (target < 0 || target >= state.project.shots.length) return;

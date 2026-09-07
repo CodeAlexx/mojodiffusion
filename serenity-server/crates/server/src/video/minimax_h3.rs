@@ -189,6 +189,14 @@ pub(super) const MINIMAX_H3_LOW_VRAM_TOTAL_MIB: u64 = 18 * 1024;
 // measured ~12.9-GiB peak. Admit the complete A/V pipeline, not just denoise.
 pub(super) const MINIMAX_H3_LOW_VRAM_MIN_FREE_MIB: u64 = 13_500;
 pub(super) const MINIMAX_H3_LOW_VRAM_ALLOCATOR_PERCENT: &str = "55";
+/// GPU arena ceiling for the fresh video-VAE decode. The decode runs as its own
+/// process and, left at the default, the allocator reserves ~84% of the card up
+/// front (measured: a 20.25 GiB chunk on a 24 GiB 3090 Ti) and then cannot serve
+/// the decode's own working allocations -- video-0076 died on a 224 MB request
+/// at 768x768x124 with CUDA_ERROR_OUT_OF_MEMORY. Capping the arena leaves that
+/// headroom. Latents are persisted before this stage, so a failed decode is
+/// retried without re-denoising.
+pub(super) const MINIMAX_H3_DECODE_ALLOCATOR_PERCENT: &str = "55";
 pub(super) const MINIMAX_H3_REF2VA_MAX_IMAGES: usize = 9;
 pub(super) const MINIMAX_H3_REF2VA_MAX_VIDEOS: usize = 3;
 pub(super) const MINIMAX_H3_REF2VA_MAX_AUDIOS: usize = 3;
@@ -1499,14 +1507,6 @@ pub(super) fn minimax_h3_ld_path() -> std::ffi::OsString {
     std::env::join_paths(paths).unwrap_or_default()
 }
 
-/// Bound the H3 runner while allowing its no-disk denoise contract: the
-/// 17.96-GiB W8A8 payload is copied once into owned host RAM in bounded chunks.
-/// Model kernels still execute on GPU.
-pub(super) fn minimax_h3_capped_command(runner: &std::path::Path) -> std::process::Command {
-    let mut command = std::process::Command::new(repo_path("scripts/mem_safe_runtime.sh"));
-    command
-        .env("MEM_MAX", "24G")
-        .env("MEM_HIGH", "infinity")
 /// The stdin-driven warm worker still needs the foreground scope wrapper:
 /// `mem_safe_runtime.sh` monitors its service in the background and therefore
 /// cannot forward a persistent stdin stream. Keep this helper isolated from
@@ -2430,6 +2430,11 @@ pub(super) fn start_minimax_h3_request(
             .env("CUDA_MODULE_LOADING", "EAGER")
             .env("LD_BIND_NOW", "1")
             .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1")
+            .env(
+                "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT",
+                MINIMAX_H3_DECODE_ALLOCATOR_PERCENT,
+            )
+            .env("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT", "100")
             .arg("decode")
             .arg(&thread_out_dir)
             .arg(steps.to_string())
@@ -3182,12 +3187,29 @@ pub(super) fn start_minimax_h3_conditioned_request(
             .env("CUDA_MODULE_LOADING", "EAGER")
             .env("LD_BIND_NOW", "1")
             .env("CUDA_FORCE_PRELOAD_LIBRARIES", "1")
+            .env(
+                "MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT",
+                MINIMAX_H3_DECODE_ALLOCATOR_PERCENT,
+            )
+            .env("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_CHUNK_PERCENT", "100")
             .arg("decode")
             .arg(&thread_out_dir)
             .arg(steps.to_string())
             .arg(seed.to_string())
             .arg("50")
-            .arg("decode_video_only")
+            // Ref2VA, unlike T2VA, never writes audio.wav: its runner ends at
+            // latents and its own result.json says decode is "not wired here".
+            // decode_video_only exists for the T2VA tail, where the denoiser has
+            // already produced audio.wav and only the video rows still need the
+            // VAE -- it decodes video and muxes that PRESERVED audio. Given no
+            // audio.wav it publishes nothing, the job failed for having no
+            // artifact, and cleanup wiped frames.rgb (video-0076/0077).
+            // decode_only decodes the audio rows from the latents as well, then
+            // muxes; it does not load the denoiser, so the 18 GiB resident trunk
+            // and its OOM are not in play. Verified on video-0077's latents:
+            // "wrote audio.wav (165600 samples/channel, 5.175 s)", "muxed ...
+            // with h264_nvenc", "DECODE-ONLY done".
+            .arg("decode_only")
             .arg(format!("--width={}", thread_geometry.width))
             .arg(format!("--height={}", thread_geometry.height))
             .arg(format!("--frames={}", thread_geometry.internal_frames))

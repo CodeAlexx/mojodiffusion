@@ -1434,6 +1434,14 @@ var H3ControlTab = (function () {
         var split = normalized.lastIndexOf('/');
         var subfolder = split >= 0 ? normalized.slice(0, split) : '';
         var filename = split >= 0 ? normalized.slice(split + 1) : normalized;
+        // /view resolves its subfolder RELATIVE to the server's out dir, but a
+        // staged upload is recorded as an absolute path. Sending the whole
+        // directory made every restored upload 404, so the Control Deck came
+        // back empty after a reload even though the file was still staged.
+        // Uploads always land in <out_dir>/uploads/, so anchor there.
+        var marker = subfolder.lastIndexOf('uploads');
+        if (marker >= 0)
+            subfolder = subfolder.slice(marker);
         return filename ? SerenityH3API.viewUrl(filename, subfolder, 'input') : '';
     }
     function restoreUploadSlot(role, slot, path) {

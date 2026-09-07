@@ -569,7 +569,12 @@
     width: 100%;
     flex: 1 1 100%;
     min-width: 0;
-    min-height: 360px;
+    /* .h3ct-run-card is sticky at the bottom of the stage, so an unbounded
+       pane pushed the transport bar underneath it and the scrubber was not
+       visible until you scrolled. Leave room for the stage header, the
+       transport and the sticky card. */
+    min-height: 280px;
+    max-height: calc(100vh - 478px);
     display: flex;
     align-items: center;
     justify-content: center;

@@ -630,15 +630,37 @@ var H3ProjectContracts = (function () {
             : (kind === 'video' ? '<Video ' + counts.video + '>' : '<Audio ' + counts.audio + '>');
     }
 
+    // Several images of ONE person must be one <Subject N> assembled from several
+    // <Picture M>, not <Subject 1>/<Subject 2>/<Subject 3>. Three views of the
+    // same man numbered as three subjects tells H3 there are three people in the
+    // shot, which is the opposite of an identity lock (video-0077 carried
+    // "<Subject 2>: fully_preserved" for what was one character sheet). Subject
+    // references sharing an `identity` label collapse onto the same number; a
+    // reference without one keeps its own, so existing single-image shots are
+    // unchanged.
+    function referenceIdentity(item) {
+        return String((item && item.identity) || '').trim().toLowerCase();
+    }
     function referenceLabel(references, index) {
         var item = references[index];
         if (item.kind === 'audio' || (item.role !== 'subject' && item.role !== 'environment_style'))
             return referenceSourceLabel(references, index);
-        var subject = 0;
+        var identity = referenceIdentity(item);
+        var seen = {}, subject = 0;
         for (var i = 0; i <= index; i++) {
-            if (references[i].kind !== 'audio' && (references[i].role === 'subject' || references[i].role === 'environment_style'))
-                subject += 1;
+            var candidate = references[i];
+            if (candidate.kind === 'audio' || (candidate.role !== 'subject' && candidate.role !== 'environment_style'))
+                continue;
+            var key = referenceIdentity(candidate);
+            if (key && Object.prototype.hasOwnProperty.call(seen, key)) {
+                if (i === index) return '<Subject ' + seen[key] + '>';
+                continue;
+            }
+            subject += 1;
+            if (key) seen[key] = subject;
         }
+        if (identity && Object.prototype.hasOwnProperty.call(seen, identity))
+            return '<Subject ' + seen[identity] + '>';
         return '<Subject ' + subject + '>';
     }
 
@@ -664,7 +686,30 @@ var H3ProjectContracts = (function () {
         // No cast defined: keep the original behaviour (honour a per-shot override).
         if (!hasCast) {
             if (String(shot.subject_definitions || '').trim()) return shot.subject_definitions;
-            return refs.map(function (item, index) { return autoDefinition(refs, item, index); }).join('\n');
+            var seenSubject = {};
+            return refs.map(function (item, index) {
+                var label = referenceLabel(refs, index);
+                if (Object.prototype.hasOwnProperty.call(seenSubject, label)) return '';
+                seenSubject[label] = true;
+                // A subject assembled from several images must name every picture
+                // it is built from and what each contributes, the way a character
+                // sheet does. Citing only the first left two of three sheet panels
+                // unreferenced in the prompt even though the request carried them.
+                var members = [];
+                refs.forEach(function (other, otherIndex) {
+                    if (referenceLabel(refs, otherIndex) === label) members.push(otherIndex);
+                });
+                if (members.length < 2) return autoDefinition(refs, item, index);
+                var sources = members.map(function (i) { return referenceSourceLabel(refs, i); });
+                var parts = members.map(function (i) {
+                    var note = String(refs[i].note || '').trim() || ('the ordered ' + refs[i].kind + ' reference');
+                    return referenceSourceLabel(refs, i) + ' - ' + note;
+                });
+                return label + ' is one identity assembled from ' + sources.join(', ') +
+                    '. Per-picture extraction: ' + parts.join('; ') +
+                    '. Treat these as the same person from different angles, not as different people;' +
+                    ' keep the face geometry, hair, build and wardrobe identical to them and unchanged across the shot.';
+            }).filter(function (line) { return !!line; }).join('\n');
         }
         // Cast defined: the cast identity is CANONICAL and identical every shot; a
         // drifting per-shot subject_definitions override is ignored for cast members.
@@ -688,8 +733,13 @@ var H3ProjectContracts = (function () {
         var cast = castPathSet(project);
         var hasCast = Object.keys(cast).length > 0;
         if (!hasCast && String(shot.retention_analysis || '').trim()) return shot.retention_analysis;
+        var emitted = {};
         return refs.map(function (item, index) {
             var label = referenceLabel(refs, index);
+            // One line per subject label: repeating it once per image restates the
+            // same character as if it were several.
+            if (Object.prototype.hasOwnProperty.call(emitted, label)) return '';
+            emitted[label] = true;
             if (hasCast && cast[String(item.path || '')]) {
                 return label + ': fully_preserved - ' + cast[String(item.path || '')].name +
                     '’s face, hair, skin tone, body, and wardrobe are identical to the reference and to every other shot; nothing about this character changes shot to shot.';
@@ -709,7 +759,7 @@ var H3ProjectContracts = (function () {
                     : 'the signal guides timbre, delivery, rhythm, or sound texture without copying unintended content.';
             }
             return label + ': ' + relation + ' - ' + explanation;
-        }).join('\n');
+        }).filter(function (line) { return !!line; }).join('\n');
     }
 
     function compilePrompt(shot, project) {
@@ -731,7 +781,15 @@ var H3ProjectContracts = (function () {
         var music = String(shot.music || '').trim() || 'N/A';
         if (mode === 'ref2va' || (mode === 'continue' && refs.length)) {
             var editing = refs.some(function (item) { return item.kind === 'video' && item.role === 'source_video'; });
-            var summary = String(shot.summary || '').trim() || ((editing ? '[video editing + reference generation] The target video is an edited version of <Video 1>. ' : '[reference generation] ') + String(shot.brief || ''));
+            // The summary has to describe the shot. Falling back to the title alone
+            // left video-0077 with "[reference generation] Cocky phone call
+            // (sheet)" and nothing about the scene, and its first ~1.5 s came back
+            // as the reference portrait instead of the apartment. Prefer the
+            // fuller of the authored description and the brief.
+            var brief = String(shot.brief || '').trim();
+            var described = String(shot.shot_description || '').trim();
+            var scene = described.length > brief.length ? described : (brief || described);
+            var summary = String(shot.summary || '').trim() || ((editing ? '[video editing + reference generation] The target video is an edited version of <Video 1>. ' : '[reference generation] ') + scene);
             return 'subject_definitions:\n' + refDefinitions(shot, refs, project) +
                 '\n\nsummary:\n' + summary +
                 '\n\nretention_analysis:\n' + refRetention(shot, refs, project) +

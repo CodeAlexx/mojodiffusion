@@ -925,12 +925,13 @@ var H3StudioTab = (function () {
         if (!id) { setStatus('Save the movie before assembling.', 'error'); return; }
         setStatus('Assembling movie\u2026', 'live');
         showToast('Assembling movie\u2026', 'live');
-        fetch('/v1/h3/projects/' + encodeURIComponent(id), {
-            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(state.project)
-        }).then(function () {
-            return fetch('/v1/h3/projects/' + encodeURIComponent(id) + '/movie', { method: 'POST' });
-        }).then(function (response) {
+        // Assembling READS the movie; it must not write the project. This used to
+        // PUT state.project first "so the server assembles what is on screen",
+        // which meant clicking Assemble rewrote the on-disk project.json as a side
+        // effect. Edits already autosave through scheduleServerSave, so the disk
+        // copy is current without this.
+        fetch('/v1/h3/projects/' + encodeURIComponent(id) + '/movie', { method: 'POST' })
+        .then(function (response) {
             return response.text().then(function (text) {
                 if (!response.ok) throw new Error(text || ('HTTP ' + response.status));
                 return JSON.parse(text);
